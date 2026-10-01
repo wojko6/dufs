@@ -7,18 +7,27 @@
  */
 
 /**
+ * @typedef {object} StorageInfo
+ * @property {number} total
+ * @property {number} used
+ * @property {number} available
+ */
+
+/**
  * @typedef {object} DATA
  * @property {string} href
  * @property {string} uri_prefix
  * @property {"Index" | "Edit" | "View"} kind
  * @property {PathItem[]} paths
  * @property {boolean} allow_upload
+ * @property {boolean} allow_move
  * @property {boolean} allow_delete
  * @property {boolean} allow_search
  * @property {boolean} allow_archive
  * @property {boolean} auth
  * @property {string} user
  * @property {boolean} dir_exists
+ * @property {StorageInfo} storage
  * @property {string} editable
  */
 
@@ -92,6 +101,10 @@ let $emptyFolder;
 /**
  * @type Element
  */
+let $storageInfo;
+/**
+ * @type Element
+ */
 let $editor;
 /**
  * @type Element
@@ -119,12 +132,12 @@ const beforeUnloadHandler = (event) => {
 window.addEventListener("DOMContentLoaded", async () => {
   const $indexData = document.getElementById('index-data');
   if (!$indexData) {
-    alert("No data");
+    alert("Brak danych");
     return;
   }
 
   DATA = JSON.parse(decodeBase64($indexData.innerHTML));
-  DIR_EMPTY_NOTE = PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
+  DIR_EMPTY_NOTE = PARAMS.q ? 'Brak wyników' : DATA.dir_exists ? 'Pusty folder' : 'Folder zostanie utworzony po przesłaniu pliku';
 
   await ready();
 });
@@ -135,6 +148,7 @@ async function ready() {
   $pathsTableBody = document.querySelector(".paths-table tbody");
   $uploadersTable = document.querySelector(".uploaders-table");
   $emptyFolder = document.querySelector(".empty-folder");
+  $storageInfo = document.querySelector(".storage-info");
   $editor = document.querySelector(".editor");
   $loginBtn = document.querySelector(".login-btn");
   $logoutBtn = document.querySelector(".logout-btn");
@@ -145,17 +159,17 @@ async function ready() {
   addBreadcrumb(DATA.href, DATA.uri_prefix);
 
   if (DATA.kind === "Index") {
-    document.title = `Index of ${DATA.href} - Dufs`;
+    document.title = `RouterCloud — ${DATA.href}`;
     document.querySelector(".index-page").classList.remove("hidden");
 
     await setupIndexPage();
   } else if (DATA.kind === "Edit") {
-    document.title = `Edit ${DATA.href} - Dufs`;
+    document.title = `Edycja ${DATA.href} — RouterCloud`;
     document.querySelector(".editor-page").classList.remove("hidden");
 
     await setupEditorPage();
   } else if (DATA.kind === "View") {
-    document.title = `View ${DATA.href} - Dufs`;
+    document.title = `Podgląd ${DATA.href} — RouterCloud`;
     document.querySelector(".editor-page").classList.remove("hidden");
 
     await setupEditorPage();
@@ -283,7 +297,7 @@ class Uploader {
   }
 
   fail(reason = "") {
-    this.$uploadStatus.innerHTML = `<span style="width: 20px;" title="${reason}">✗</span><span class="retry-btn" id="retry${this.idx}" title="Retry">↻</span>`;
+    this.$uploadStatus.innerHTML = `<span style="width: 20px;" title="${reason}">✗</span><span class="retry-btn" id="retry${this.idx}" title="Ponów">↻</span>`;
     failUploaders.set(this.idx, this);
     Uploader.runnings--;
     Uploader.runQueue();
@@ -343,7 +357,7 @@ function addBreadcrumb(href, uri_prefix) {
     }
     const encodedName = encodedStr(name);
     if (i === 0) {
-      $breadcrumb.insertAdjacentHTML("beforeend", `<a href="${path}" title="Root"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M6.5 14.5v-3.505c0-.245.25-.495.5-.495h2c.25 0 .5.25.5.5v3.5a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.146-.354L13 5.793V2.5a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1.293L8.354 1.146a.5.5 0 0 0-.708 0l-6 6A.5.5 0 0 0 1.5 7.5v7a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5z"/></svg></a>`);
+      $breadcrumb.insertAdjacentHTML("beforeend", `<a href="${path}" title="Katalog główny"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M6.5 14.5v-3.505c0-.245.25-.495.5-.495h2c.25 0 .5.25.5.5v3.5a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.146-.354L13 5.793V2.5a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1.293L8.354 1.146a.5.5 0 0 0-.708 0l-6 6A.5.5 0 0 0 1.5 7.5v7a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5z"/></svg></a>`);
     } else if (i === len - 1) {
       $breadcrumb.insertAdjacentHTML("beforeend", `<b>${encodedName}</b>`);
     } else {
@@ -355,11 +369,37 @@ function addBreadcrumb(href, uri_prefix) {
   }
 }
 
+function formatStorageBytes(size) {
+  const [value, unit] = formatFileSize(size);
+  const localizedValue = String(value).replace(".", ",");
+  return `${localizedValue} ${unit}`;
+}
+
+function setupStorageInfo() {
+  const storage = DATA.storage;
+
+  if (!storage || !storage.total || !$storageInfo) {
+    return;
+  }
+
+  const usedPercent = (storage.used / storage.total) * 100;
+  const percent = formatPercent(usedPercent).replace(".", ",");
+
+  $storageInfo.textContent =
+    `Dysk: ${formatStorageBytes(storage.used)} zajęte • ` +
+    `${formatStorageBytes(storage.available)} dostępne • ` +
+    `${formatStorageBytes(storage.total)} razem • ${percent}`;
+
+  $storageInfo.classList.remove("hidden");
+}
+
 async function setupIndexPage() {
+  setupStorageInfo();
+
   if (DATA.allow_archive) {
     const $download = document.querySelector(".download");
     $download.href = baseUrl() + "?zip";
-    $download.title = "Download folder as a .zip file";
+    $download.title = "Pobierz folder jako plik .zip";
     $download.classList.add("dlwt");
     $download.classList.remove("hidden");
   }
@@ -395,17 +435,17 @@ function renderPathsTableHead() {
     {
       name: "name",
       props: `colspan="2"`,
-      text: "Name",
+      text: "Nazwa",
     },
     {
       name: "mtime",
       props: ``,
-      text: "Last Modified",
+      text: "Ostatnia modyfikacja",
     },
     {
       name: "size",
       props: ``,
-      text: "Size",
+      text: "Rozmiar",
     }
   ];
   $pathsTableHead.insertAdjacentHTML("beforeend", `
@@ -425,7 +465,7 @@ function renderPathsTableHead() {
     const icon = `<span>${svg}</span>`
     return `<th class="cell-${item.name}" ${item.props}><a href="?${qs}">${item.text}${icon}</a></th>`
   }).join("\n")}
-      <th class="cell-actions">Actions</th>
+      <th class="cell-actions">Akcje</th>
     </tr>
   `);
 }
@@ -467,27 +507,27 @@ function addPath(file, index) {
     if (DATA.allow_archive) {
       actionDownload = `
       <div class="action-btn">
-        <a class="dlwt" href="${url}?zip" title="Download folder as a .zip file" download>${ICONS.download}</a>
+        <a class="dlwt" href="${url}?zip" title="Pobierz folder jako plik .zip" download>${ICONS.download}</a>
       </div>`;
     }
   } else {
     actionDownload = `
     <div class="action-btn" >
-      <a class="dlwt" href="${url}" title="Download file" download>${ICONS.download}</a>
+      <a class="dlwt" href="${url}" title="Pobierz plik" download>${ICONS.download}</a>
     </div>`;
   }
+  if (DATA.allow_move) {
+    actionMove = `<div onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Zmień nazwę">${ICONS.move}</div>`;
+  }
   if (DATA.allow_delete) {
-    if (DATA.allow_upload) {
-      actionMove = `<div onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename">${ICONS.move}</div>`;
-      if (!isDir) {
-        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${url}?edit">${ICONS.edit}</a>`;
-      }
+    if (DATA.allow_upload && !isDir) {
+      actionEdit = `<a class="action-btn" title="Edytuj plik" target="_blank" href="${url}?edit">${ICONS.edit}</a>`;
     }
     actionDelete = `
-    <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete">${ICONS.delete}</div>`;
+    <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Usuń">${ICONS.delete}</div>`;
   }
   if (!actionEdit && !isDir) {
-    actionView = `<a class="action-btn" title="View file" target="_blank" href="${url}?view">${ICONS.view}</a>`;
+    actionView = `<a class="action-btn" title="Wyświetl plik" target="_blank" href="${url}?view">${ICONS.view}</a>`;
   }
   let actionCell = `
   <td class="cell-actions">
@@ -564,7 +604,7 @@ function setupDownloadWithToken() {
         const tokengenUrl = new URL(originalHref);
         tokengenUrl.searchParams.set("tokengen", "");
         const res = await fetch(tokengenUrl);
-        if (!res.ok) throw new Error("Failed to fetch token");
+        if (!res.ok) throw new Error("Nie udało się pobrać tokenu");
         const token = await res.text();
         const downloadUrl = new URL(originalHref);
         downloadUrl.searchParams.set("token", token);
@@ -575,7 +615,7 @@ function setupDownloadWithToken() {
         tempA.click();
         document.body.removeChild(tempA);
       } catch (err) {
-        alert(`Failed to download, ${err.message}`);
+        alert(`Nie udało się pobrać pliku: ${err.message}`);
       }
     });
   });
@@ -613,7 +653,7 @@ function setupNewFolder() {
   const $newFolder = document.querySelector(".new-folder");
   $newFolder.classList.remove("hidden");
   $newFolder.addEventListener("click", () => {
-    const name = prompt("Enter folder name");
+    const name = prompt("Podaj nazwę folderu");
     if (name) createFolder(name);
   });
 }
@@ -622,7 +662,7 @@ function setupNewFile() {
   const $newFile = document.querySelector(".new-file");
   $newFile.classList.remove("hidden");
   $newFile.addEventListener("click", () => {
-    const name = prompt("Enter file name");
+    const name = prompt("Podaj nazwę pliku");
     if (name) createFile(name);
   });
 }
@@ -635,25 +675,29 @@ async function setupEditorPage() {
   $download.href = url;
 
   if (DATA.kind == "Edit") {
-    const $moveFile = document.querySelector(".move-file");
-    $moveFile.classList.remove("hidden");
-    $moveFile.addEventListener("click", async () => {
-      const query = location.href.slice(url.length);
-      const newFileUrl = await doMovePath(url);
-      if (newFileUrl) {
-        location.href = newFileUrl + query;
-      }
-    });
-
-    const $deleteFile = document.querySelector(".delete-file");
-    $deleteFile.classList.remove("hidden");
-    $deleteFile.addEventListener("click", async () => {
-      const url = baseUrl();
-      const name = baseName(url);
-      await doDeletePath(name, url, () => {
-        location.href = location.href.split("/").slice(0, -1).join("/");
+    if (DATA.allow_move) {
+      const $moveFile = document.querySelector(".move-file");
+      $moveFile.classList.remove("hidden");
+      $moveFile.addEventListener("click", async () => {
+        const query = location.href.slice(url.length);
+        const newFileUrl = await doMovePath(url);
+        if (newFileUrl) {
+          location.href = newFileUrl + query;
+        }
       });
-    });
+    }
+
+    if (DATA.allow_delete) {
+      const $deleteFile = document.querySelector(".delete-file");
+      $deleteFile.classList.remove("hidden");
+      $deleteFile.addEventListener("click", async () => {
+        const url = baseUrl();
+        const name = baseName(url);
+        await doDeletePath(name, url, () => {
+          location.href = location.href.split("/").slice(0, -1).join("/");
+        });
+      });
+    }
 
     if (DATA.editable) {
       const $saveBtn = document.querySelector(".save-btn");
@@ -672,7 +716,7 @@ async function setupEditorPage() {
       $notEditable.insertAdjacentHTML("afterend", `<iframe src="${url}" sandbox width="100%" height="${window.innerHeight - 100}px"></iframe>`);
     } else {
       $notEditable.classList.remove("hidden");
-      $notEditable.textContent = "Cannot edit because file is too large or binary.";
+      $notEditable.textContent = "Nie można edytować: plik jest zbyt duży lub binarny.";
     }
     return;
   }
@@ -691,7 +735,7 @@ async function setupEditorPage() {
       $editor.value = decoder.decode(dataView);
     }
   } catch (err) {
-    alert(`Failed to get file, ${err.message}`);
+    alert(`Nie udało się pobrać pliku: ${err.message}`);
   }
 }
 
@@ -715,7 +759,7 @@ async function deletePath(index) {
 }
 
 async function doDeletePath(name, url, cb) {
-  if (!confirm(`Delete \`${name}\`?`)) return;
+  if (!confirm(`Usunąć \`${name}\`?`)) return;
   try {
     await checkAuth();
     const res = await fetch(url, {
@@ -724,7 +768,7 @@ async function doDeletePath(name, url, cb) {
     await assertResOK(res);
     cb();
   } catch (err) {
-    alert(`Cannot delete \`${file.name}\`, ${err.message}`);
+    alert(`Nie można usunąć \`${name}\`: ${err.message}`);
   }
 }
 
@@ -745,37 +789,51 @@ async function movePath(index) {
 
 async function doMovePath(fileUrl) {
   const fileUrlObj = new URL(fileUrl);
-
   const prefix = DATA.uri_prefix.slice(0, -1);
-
   const filePath = decodeURIComponent(fileUrlObj.pathname.slice(prefix.length));
 
-  let newPath = prompt("Enter new path", filePath);
-  if (!newPath) return;
-  if (!newPath.startsWith("/")) newPath = "/" + newPath;
-  if (filePath === newPath) return;
-  const newFileUrl = fileUrlObj.origin + prefix + newPath.split("/").map(encodeURIComponent).join("/");
+  const lastSlash = filePath.lastIndexOf("/");
+  const parentPath = filePath.slice(0, lastSlash + 1);
+  const currentName = filePath.slice(lastSlash + 1);
+
+  const newName = prompt("Podaj nową nazwę", currentName);
+  if (!newName || newName === currentName) return;
+
+  if (
+    newName === "." ||
+    newName === ".." ||
+    newName.includes("/") ||
+    newName.includes("\\")
+  ) {
+    alert("Podaj wyłącznie nazwę pliku lub folderu, bez ścieżki.");
+    return;
+  }
+
+  const newPath = parentPath + newName;
+  const newFileUrl =
+    fileUrlObj.origin +
+    prefix +
+    newPath.split("/").map(encodeURIComponent).join("/");
 
   try {
     await checkAuth();
-    const res1 = await fetch(newFileUrl, {
-      method: "HEAD",
-    });
-    if (res1.status === 200) {
-      if (!confirm("Override existing file?")) {
-        return;
-      }
-    }
-    const res2 = await fetch(fileUrl, {
+
+    const res = await fetch(fileUrl, {
       method: "MOVE",
       headers: {
         "Destination": newFileUrl,
       }
     });
-    await assertResOK(res2);
+
+    if (res.status === 409) {
+      alert(`Nie można zmienić nazwy \`${currentName}\`: taka nazwa już istnieje.`);
+      return;
+    }
+
+    await assertResOK(res);
     return newFileUrl;
   } catch (err) {
-    alert(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
+    alert(`Nie można zmienić nazwy \`${currentName}\` na \`${newName}\`: ${err.message}`);
   }
 }
 
@@ -791,7 +849,7 @@ async function saveChange() {
     });
     location.reload();
   } catch (err) {
-    alert(`Failed to save file, ${err.message}`);
+    alert(`Nie udało się zapisać pliku: ${err.message}`);
   }
 }
 
@@ -832,7 +890,7 @@ async function createFolder(name) {
     await assertResOK(res);
     location.href = url;
   } catch (err) {
-    alert(`Cannot create folder \`${name}\`, ${err.message}`);
+    alert(`Nie można utworzyć folderu \`${name}\`: ${err.message}`);
   }
 }
 
@@ -847,7 +905,7 @@ async function createFile(name) {
     await assertResOK(res);
     location.href = url + "?edit";
   } catch (err) {
-    alert(`Cannot create file \`${name}\`, ${err.message}`);
+    alert(`Nie można utworzyć pliku \`${name}\`: ${err.message}`);
   }
 }
 
@@ -927,8 +985,21 @@ function padZero(value, size) {
 }
 
 function formatDirSize(size) {
-  const unit = size === 1 ? "item" : "items";
   const num = size >= MAX_SUBPATHS_COUNT ? `>${MAX_SUBPATHS_COUNT - 1}` : `${size}`;
+
+  let unit;
+  if (size === 1) {
+    unit = "element";
+  } else if (
+    size % 10 >= 2 &&
+    size % 10 <= 4 &&
+    !(size % 100 >= 12 && size % 100 <= 14)
+  ) {
+    unit = "elementy";
+  } else {
+    unit = "elementów";
+  }
+
   return ` ${num} ${unit}`;
 }
 
@@ -971,7 +1042,7 @@ function encodedStr(rawStr) {
 
 async function assertResOK(res) {
   if (!(res.status >= 200 && res.status < 300)) {
-    throw new Error(await res.text() || `Invalid status ${res.status}`);
+    throw new Error(await res.text() || `Nieprawidłowy status HTTP ${res.status}`);
   }
 }
 

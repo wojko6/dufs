@@ -66,6 +66,21 @@ fn get_dir_json(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     );
     let json: Value = serde_json::from_str(&resp.text().unwrap()).unwrap();
     assert!(json["paths"].as_array().is_some());
+
+    #[cfg(unix)]
+    {
+        let storage = json["storage"]
+            .as_object()
+            .expect("storage information should be available on Unix");
+
+        let total = storage["total"].as_u64().expect("total bytes");
+        let used = storage["used"].as_u64().expect("used bytes");
+        let available = storage["available"].as_u64().expect("available bytes");
+
+        assert!(total > 0);
+        assert!(used <= total);
+        assert!(available <= total);
+    }
     Ok(())
 }
 

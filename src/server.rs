@@ -66,9 +66,123 @@ const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
+
+fn compute_assets_revision(assets_path: Option<&Path>) -> String {
+    let mut hasher = Sha256::new();
+
+    if let Some(assets_path) = assets_path {
+        for name in ["index.html", "index.css", "index.js", "favicon.ico"] {
+            hasher.update(name.as_bytes());
+            if let Ok(data) = std::fs::read(assets_path.join(name)) {
+                hasher.update(&data);
+            }
+        }
+    } else {
+        hasher.update(INDEX_HTML.as_bytes());
+        hasher.update(INDEX_CSS.as_bytes());
+        hasher.update(INDEX_JS.as_bytes());
+        hasher.update(FAVICON_ICO);
+    }
+
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{:02x}", *byte))
+        .collect()
+}
+
+
+#[derive(Debug, Serialize)]
+pub struct StorageInfo {
+    pub total: u64,
+    pub used: u64,
+    pub available: u64,
+}
+
+#[cfg(unix)]
+fn get_storage_info(path: &Path) -> Option<StorageInfo> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+
+    let stat = unsafe { stat.assume_init() };
+
+    let block_size = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+
+    let total = (stat.f_blocks as u64).saturating_mul(block_size);
+    let free = (stat.f_bfree as u64).saturating_mul(block_size);
+    let available = (stat.f_bavail as u64).saturating_mul(block_size);
+
+    Some(StorageInfo {
+        total,
+        used: total.saturating_sub(free),
+        available,
+    })
+}
+
+#[cfg(not(unix))]
+fn get_storage_info(_path: &Path) -> Option<StorageInfo> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+async fn rename_noreplace(path: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let dest = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+
+    tokio::task::spawn_blocking(move || {
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                libc::AT_FDCWD,
+                dest.as_ptr(),
+                libc::RENAME_NOREPLACE as libc::c_uint,
+            )
+        };
+
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+    .await
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn rename_noreplace(path: &Path, dest: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(dest).await {
+        Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::rename(path, dest).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 pub struct Server {
     args: Args,
     assets_prefix: String,
+    assets_revision: String,
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
@@ -77,6 +191,7 @@ pub struct Server {
 impl Server {
     pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
         let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
+        let assets_revision = compute_assets_revision(args.assets.as_deref());
         let single_file_req_paths = if args.path_is_file {
             vec![
                 args.uri_prefix.to_string(),
@@ -99,6 +214,7 @@ impl Server {
             running,
             single_file_req_paths,
             assets_prefix,
+            assets_revision,
             html,
         })
     }
@@ -266,6 +382,7 @@ impl Server {
         };
 
         let allow_upload = self.args.allow_upload;
+        let allow_move = self.args.allow_move;
         let allow_delete = self.args.allow_delete;
         let allow_search = self.args.allow_search;
         let allow_archive = self.args.allow_archive;
@@ -482,7 +599,7 @@ impl Server {
                     }
                 }
                 "MOVE" => {
-                    if !allow_upload || !allow_delete {
+                    if !allow_move {
                         status_forbid(&mut res);
                     } else if is_miss {
                         status_not_found(&mut res);
@@ -1044,6 +1161,7 @@ impl Server {
                 "__ASSETS_PREFIX__",
                 &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
             )
+            .replace("__ASSETS_REV__", &self.assets_revision)
             .replace("__INDEX_DATA__", &index_data);
         res.headers_mut()
             .typed_insert(ContentLength(output.len() as u64));
@@ -1187,16 +1305,26 @@ impl Server {
             }
         };
 
-        ensure_path_parent(&dest).await?;
+        // RouterCloud safe-rename policy:
+        // rename only inside the current directory.
+        if path.parent() != dest.parent() {
+            status_forbid(res);
+            return Ok(());
+        }
 
         if self.guard_root_contained(&dest).await {
             status_bad_request(res, "Invalid Destination");
             return Ok(());
         }
 
-        fs::rename(path, &dest).await?;
-
-        status_no_content(res);
+        match rename_noreplace(path, &dest).await {
+            Ok(()) => status_no_content(res),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                *res.status_mut() = StatusCode::CONFLICT;
+                *res.body_mut() = body_full("Destination already exists");
+            }
+            Err(err) => return Err(err.into()),
+        }
         Ok(())
     }
 
@@ -1302,6 +1430,7 @@ impl Server {
             href,
             uri_prefix: self.args.uri_prefix.clone(),
             allow_upload: self.args.allow_upload && readwrite,
+            allow_move: self.args.allow_move && readwrite,
             allow_delete: self.args.allow_delete && readwrite,
             allow_search: self.args.allow_search,
             allow_archive: self.args.allow_archive,
@@ -1309,6 +1438,7 @@ impl Server {
             auth: self.args.auth.has_users(),
             user,
             paths,
+            storage: get_storage_info(&self.args.serve_path),
         };
         let output = if has_query_flag(query_params, "json") {
             res.headers_mut()
@@ -1328,6 +1458,7 @@ impl Server {
                     "__ASSETS_PREFIX__",
                     &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
                 )
+                .replace("__ASSETS_REV__", &self.assets_revision)
                 .replace("__INDEX_DATA__", &index_data)
         };
         res.headers_mut()
@@ -1559,6 +1690,7 @@ pub struct IndexData {
     pub kind: DataKind,
     pub uri_prefix: String,
     pub allow_upload: bool,
+    pub allow_move: bool,
     pub allow_delete: bool,
     pub allow_search: bool,
     pub allow_archive: bool,
@@ -1566,6 +1698,7 @@ pub struct IndexData {
     pub auth: bool,
     pub user: Option<String>,
     pub paths: Vec<PathItem>,
+    pub storage: Option<StorageInfo>,
 }
 
 #[derive(Debug, Serialize, Eq, PartialEq, Ord, PartialOrd)]

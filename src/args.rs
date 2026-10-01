@@ -117,6 +117,14 @@ pub fn build_cli() -> Command {
                 .help("Allow upload files/folders"),
         )
         .arg(
+            Arg::new("allow-move")
+                .env("DUFS_ALLOW_MOVE")
+                .hide_env(true)
+                .long("allow-move")
+                .action(ArgAction::SetTrue)
+                .help("Allow move/rename files and folders"),
+        )
+        .arg(
             Arg::new("allow-delete")
                 .env("DUFS_ALLOW_DELETE")
 				.hide_env(true)
@@ -285,6 +293,7 @@ pub struct Args {
     pub auth: AccessControl,
     pub allow_all: bool,
     pub allow_upload: bool,
+    pub allow_move: bool,
     pub allow_delete: bool,
     pub allow_search: bool,
     pub allow_symlink: bool,
@@ -375,6 +384,9 @@ impl Args {
 
         if !args.allow_upload {
             args.allow_upload = allow_all || matches.get_flag("allow-upload");
+        }
+        if !args.allow_move {
+            args.allow_move = allow_all || matches.get_flag("allow-move");
         }
         if !args.allow_delete {
             args.allow_delete = allow_all || matches.get_flag("allow-delete");

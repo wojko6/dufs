@@ -112,6 +112,14 @@ body {
   padding: 0 1em;
 }
 
+
+.storage-info {
+  margin: 0.5em 0 0.7em 0;
+  font-size: 0.9em;
+  color: #5c5c5c;
+  font-variant-numeric: tabular-nums;
+}
+
 .empty-folder {
   font-style: italic;
 }
@@ -271,6 +279,10 @@ body {
   .uploaders-table th,
   .paths-table th {
     color: #ddd;
+  }
+
+  .storage-info {
+    color: #aaa;
   }
 
   svg,

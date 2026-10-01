@@ -188,6 +188,106 @@ fn move_not_allow_delete(#[with(&["--allow-upload"])] server: TestServer) -> Res
 }
 
 #[rstest]
+fn move_allowed_delete_still_denied(
+    #[with(&["--allow-move"])] server: TestServer,
+) -> Result<(), Error> {
+    let origin_url = format!("{}test.html", server.url());
+    let new_url = format!("{}renamed.html", server.url());
+
+    let resp = fetch!(b"MOVE", &origin_url)
+        .header("Destination", &new_url)
+        .send()?;
+    assert_eq!(resp.status(), 204);
+
+    let resp = reqwest::blocking::get(&new_url)?;
+    assert_eq!(resp.status(), 200);
+
+    let resp = fetch!(b"DELETE", &new_url).send()?;
+    assert_eq!(resp.status(), 403);
+
+    Ok(())
+}
+
+#[rstest]
+fn move_refuses_existing_destination(
+    #[with(&["--allow-move"])] server: TestServer,
+) -> Result<(), Error> {
+    let origin_url = format!("{}test.html", server.url());
+    let existing_url = format!("{}index.html", server.url());
+
+    let resp = fetch!(b"MOVE", &origin_url)
+        .header("Destination", &existing_url)
+        .send()?;
+    assert_eq!(resp.status(), 409);
+
+    let resp = reqwest::blocking::get(&origin_url)?;
+    assert_eq!(resp.status(), 200);
+
+    Ok(())
+}
+
+#[rstest]
+fn move_refuses_cross_directory(
+    #[with(&["--allow-move"])] server: TestServer,
+) -> Result<(), Error> {
+    let origin_url = format!("{}test.html", server.url());
+    let new_url = format!("{}dir1/test2.html", server.url());
+
+    let resp = fetch!(b"MOVE", &origin_url)
+        .header("Destination", &new_url)
+        .send()?;
+    assert_eq!(resp.status(), 403);
+
+    let resp = reqwest::blocking::get(&origin_url)?;
+    assert_eq!(resp.status(), 200);
+
+    Ok(())
+}
+
+#[rstest]
+fn move_requires_explicit_allow_move(
+    #[with(&["--allow-upload", "--allow-delete"])] server: TestServer,
+) -> Result<(), Error> {
+    let origin_url = format!("{}test.html", server.url());
+    let new_url = format!("{}combined-flags.html", server.url());
+
+    let resp = fetch!(b"MOVE", &origin_url)
+        .header("Destination", &new_url)
+        .send()?;
+    assert_eq!(resp.status(), 403);
+
+    let resp = reqwest::blocking::get(&origin_url)?;
+    assert_eq!(resp.status(), 200);
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn move_refuses_dangling_symlink_destination(
+    #[with(&["--allow-move"])] server: TestServer,
+) -> Result<(), Error> {
+    let origin_url = format!("{}test.html", server.url());
+    let dest_url = format!("{}dangling.html", server.url());
+    let dest_path = server.path().join("dangling.html");
+
+    std::os::unix::fs::symlink("missing-target", &dest_path)?;
+
+    let resp = fetch!(b"MOVE", &origin_url)
+        .header("Destination", &dest_url)
+        .send()?;
+    assert_eq!(resp.status(), 409);
+
+    let resp = reqwest::blocking::get(&origin_url)?;
+    assert_eq!(resp.status(), 200);
+
+    let meta = std::fs::symlink_metadata(&dest_path)?;
+    assert!(meta.file_type().is_symlink());
+
+    Ok(())
+}
+
+#[rstest]
 fn move_file_404(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     let new_url = format!("{}test2.html", server.url());
     let resp = fetch!(b"MOVE", format!("{}404", server.url()))

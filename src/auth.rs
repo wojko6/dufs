@@ -20,6 +20,12 @@ const REALM: &str = "DUFS";
 const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60 * 24 * 7; // 7 days
 const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
 
+// RouterCloud browser session.
+// Kept separate from DUFS path-scoped download tokens.
+const ROUTERCLOUD_SESSION_EXPIRATION: u64 = 1000 * 60 * 60 * 12; // 12 hours
+const ROUTERCLOUD_SESSION_VERSION: u8 = 1;
+const ROUTERCLOUD_SESSION_CONTEXT: &str = "routercloud-session-v1";
+
 lazy_static! {
     static ref NONCESTARTHASH: Context = {
         let mut h = Context::new();
@@ -111,6 +117,90 @@ impl AccessControl {
 
     pub fn has_users(&self) -> bool {
         !self.users.is_empty()
+    }
+
+    /// Authenticate a username/password pair without exposing the stored
+    /// password or password hash to the caller.
+    pub fn authenticate_password(&self, user: &str, password: &str) -> Option<AccessPaths> {
+        let (stored_password, access_paths) = self.users.get(user)?;
+
+        if verify_password(password, stored_password) {
+            Some(access_paths.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Generate a RouterCloud browser-session token.
+    ///
+    /// The token contains no password. It is signed with a key derived from
+    /// the configured account credential, so changing the credential
+    /// automatically invalidates all previously issued sessions.
+    pub fn generate_session_token(&self, user: &str) -> Result<String> {
+        let exp = unix_now().as_millis() as u64 + ROUTERCLOUD_SESSION_EXPIRATION;
+        self.generate_session_token_until(user, exp)
+    }
+
+    fn generate_session_token_until(&self, user: &str, exp: u64) -> Result<String> {
+        let (stored_password, _) = self
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+
+        let message = format!("{ROUTERCLOUD_SESSION_CONTEXT}:{user}:{exp}");
+        let mut signing_key = derive_secret_key(user, stored_password);
+        let signature = signing_key.sign(message.as_bytes()).to_bytes();
+
+        let mut raw = Vec::with_capacity(1 + 64 + 8 + user.len());
+        raw.push(ROUTERCLOUD_SESSION_VERSION);
+        raw.extend_from_slice(&signature);
+        raw.extend_from_slice(&exp.to_be_bytes());
+        raw.extend_from_slice(user.as_bytes());
+
+        Ok(hex::encode(raw))
+    }
+
+    /// Verify a RouterCloud browser-session token.
+    pub fn verify_session_token<'a>(&'a self, token: &str) -> Result<(String, &'a AccessPaths)> {
+        let raw = hex::decode(token)?;
+
+        // version + signature + expiry + at least one username byte
+        if raw.len() < 74 {
+            bail!("Invalid RouterCloud session token");
+        }
+
+        if raw[0] != ROUTERCLOUD_SESSION_VERSION {
+            bail!("Unsupported RouterCloud session token version");
+        }
+
+        let signature_bytes = &raw[1..65];
+        let exp_bytes = &raw[65..73];
+        let user_bytes = &raw[73..];
+
+        let exp = u64::from_be_bytes(exp_bytes.try_into()?);
+
+        if unix_now().as_millis() as u64 > exp {
+            bail!("RouterCloud session expired");
+        }
+
+        let user = std::str::from_utf8(user_bytes)?;
+
+        if user.is_empty() {
+            bail!("Invalid RouterCloud session user");
+        }
+
+        let (stored_password, access_paths) = self
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+
+        let signature = Signature::from_bytes(&<[u8; 64]>::try_from(signature_bytes)?);
+
+        let message = format!("{ROUTERCLOUD_SESSION_CONTEXT}:{user}:{exp}");
+
+        derive_secret_key(user, stored_password).verify(message.as_bytes(), &signature)?;
+
+        Ok((user.to_string(), access_paths))
     }
 
     pub fn guard(
@@ -413,6 +503,16 @@ pub fn get_auth_user(authorization: &HeaderValue) -> Option<String> {
     }
 }
 
+fn verify_password(password: &str, stored_password: &str) -> bool {
+    if stored_password.starts_with("$6$") {
+        sha_crypt::ShaCrypt::SHA512
+            .verify_password(password.as_bytes(), stored_password)
+            .is_ok()
+    } else {
+        password == stored_password
+    }
+}
+
 pub fn check_auth(
     authorization: &HeaderValue,
     method: &str,
@@ -427,18 +527,11 @@ pub fn check_auth(
             return None;
         }
 
-        if auth_pass.starts_with("$6$") {
-            if sha_crypt::ShaCrypt::SHA512
-                .verify_password(pass.as_bytes(), auth_pass)
-                .is_ok()
-            {
-                return Some(());
-            }
-        } else if pass == auth_pass {
-            return Some(());
+        if verify_password(pass, auth_pass) {
+            Some(())
+        } else {
+            None
         }
-
-        None
     } else if let Some(value) = strip_prefix(authorization.as_bytes(), b"Digest ") {
         let digest_map = to_headermap(value).ok()?;
         if let (Some(username), Some(nonce), Some(user_response)) = (
@@ -749,5 +842,40 @@ mod tests {
             paths.find("dir2/dir23//dir231/file"),
             Some(AccessPaths::new(AccessPerm::ReadWrite))
         );
+    }
+
+    #[test]
+    fn test_routercloud_session_auth() {
+        let auth = AccessControl::new(&["alice:secret@/:rw"]).unwrap();
+
+        assert!(auth.authenticate_password("alice", "secret").is_some());
+
+        assert!(auth
+            .authenticate_password("alice", "wrong-password")
+            .is_none());
+
+        assert!(auth.authenticate_password("unknown", "secret").is_none());
+
+        let token = auth.generate_session_token("alice").unwrap();
+
+        let (user, access_paths) = auth.verify_session_token(&token).unwrap();
+
+        assert_eq!(user, "alice");
+        assert!(access_paths.perm().readwrite());
+
+        // Any modification of the signed token must invalidate it.
+        let mut tampered = token.into_bytes();
+        let last = tampered.len() - 1;
+
+        tampered[last] = if tampered[last] == b'0' { b'1' } else { b'0' };
+
+        let tampered = String::from_utf8(tampered).unwrap();
+
+        assert!(auth.verify_session_token(&tampered).is_err());
+
+        // Explicitly expired token.
+        let expired = auth.generate_session_token_until("alice", 0).unwrap();
+
+        assert!(auth.verify_session_token(&expired).is_err());
     }
 }

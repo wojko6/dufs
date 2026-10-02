@@ -133,6 +133,15 @@ pub fn build_cli() -> Command {
                 .help("Allow delete files/folders"),
         )
         .arg(
+            Arg::new("routercloud-allow-delete")
+                .env("DUFS_ROUTERCLOUD_ALLOW_DELETE")
+                .hide(true)
+                .hide_env(true)
+                .long("routercloud-allow-delete")
+                .action(ArgAction::SetTrue)
+                .help("Allow RouterCloud DELETE without enabling overwrite semantics"),
+        )
+        .arg(
             Arg::new("allow-search")
                 .env("DUFS_ALLOW_SEARCH")
 				.hide_env(true)
@@ -295,6 +304,7 @@ pub struct Args {
     pub allow_upload: bool,
     pub allow_move: bool,
     pub allow_delete: bool,
+    pub routercloud_allow_delete: bool,
     pub allow_search: bool,
     pub allow_symlink: bool,
     pub allow_archive: bool,
@@ -390,6 +400,10 @@ impl Args {
         }
         if !args.allow_delete {
             args.allow_delete = allow_all || matches.get_flag("allow-delete");
+        }
+        if !args.routercloud_allow_delete {
+            args.routercloud_allow_delete =
+                matches.get_flag("routercloud-allow-delete");
         }
         if !args.allow_search {
             args.allow_search = allow_all || matches.get_flag("allow-search");

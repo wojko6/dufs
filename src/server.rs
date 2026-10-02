@@ -498,6 +498,8 @@ impl Server {
         let allow_upload = self.args.allow_upload;
         let allow_move = self.args.allow_move;
         let allow_delete = self.args.allow_delete;
+        let allow_remove =
+            allow_delete || self.args.routercloud_allow_delete;
         let allow_search = self.args.allow_search;
         let allow_archive = self.args.allow_archive;
         let render_index = self.args.render_index;
@@ -660,7 +662,9 @@ impl Server {
                 }
             }
             Method::DELETE => {
-                if !allow_delete {
+                if path == self.args.serve_path.as_path() {
+                    status_forbid(&mut res);
+                } else if !allow_remove {
                     status_forbid(&mut res);
                 } else if !is_miss {
                     self.handle_delete(path, is_dir, &mut res).await?
@@ -1261,7 +1265,8 @@ impl Server {
             kind,
             uri_prefix: self.args.uri_prefix.clone(),
             allow_upload: self.args.allow_upload,
-            allow_delete: self.args.allow_delete,
+            allow_delete: self.args.allow_delete
+                || self.args.routercloud_allow_delete,
             auth: self.args.auth.has_users(),
             user,
             editable,
@@ -1545,7 +1550,9 @@ impl Server {
             uri_prefix: self.args.uri_prefix.clone(),
             allow_upload: self.args.allow_upload && readwrite,
             allow_move: self.args.allow_move && readwrite,
-            allow_delete: self.args.allow_delete && readwrite,
+            allow_delete: (self.args.allow_delete
+                || self.args.routercloud_allow_delete)
+                && readwrite,
             allow_search: self.args.allow_search,
             allow_archive: self.args.allow_archive,
             dir_exists: exist,

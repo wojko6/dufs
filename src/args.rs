@@ -142,6 +142,15 @@ pub fn build_cli() -> Command {
                 .help("Allow RouterCloud DELETE without enabling overwrite semantics"),
         )
         .arg(
+            Arg::new("routercloud-allow-edit")
+                .env("DUFS_ROUTERCLOUD_ALLOW_EDIT")
+                .hide(true)
+                .hide_env(true)
+                .long("routercloud-allow-edit")
+                .action(ArgAction::SetTrue)
+                .help("Allow isolated RouterCloud text editing"),
+        )
+        .arg(
             Arg::new("allow-search")
                 .env("DUFS_ALLOW_SEARCH")
 				.hide_env(true)
@@ -305,6 +314,7 @@ pub struct Args {
     pub allow_move: bool,
     pub allow_delete: bool,
     pub routercloud_allow_delete: bool,
+    pub routercloud_allow_edit: bool,
     pub allow_search: bool,
     pub allow_symlink: bool,
     pub allow_archive: bool,
@@ -404,6 +414,10 @@ impl Args {
         if !args.routercloud_allow_delete {
             args.routercloud_allow_delete =
                 matches.get_flag("routercloud-allow-delete");
+        }
+        if !args.routercloud_allow_edit {
+            args.routercloud_allow_edit =
+                matches.get_flag("routercloud-allow-edit");
         }
         if !args.allow_search {
             args.allow_search = allow_all || matches.get_flag("allow-search");

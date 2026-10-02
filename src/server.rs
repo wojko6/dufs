@@ -72,6 +72,7 @@ const ROUTERCLOUD_LOGOUT_PATH: &str = "/__routercloud/logout";
 const ROUTERCLOUD_SESSION_COOKIE: &str = "__Host-routercloud_session";
 const ROUTERCLOUD_SESSION_MAX_AGE: u64 = 60 * 60 * 12;
 const ROUTERCLOUD_LOGIN_BODY_MAX: usize = 8192;
+const ROUTERCLOUD_EDIT_BODY_MAX: usize = EDITABLE_TEXT_MAX_SIZE as usize;
 
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
@@ -500,6 +501,8 @@ impl Server {
         let allow_delete = self.args.allow_delete;
         let allow_remove =
             allow_delete || self.args.routercloud_allow_delete;
+        let allow_routercloud_edit =
+            self.args.routercloud_allow_edit;
         let allow_search = self.args.allow_search;
         let allow_archive = self.args.allow_archive;
         let render_index = self.args.render_index;
@@ -673,6 +676,19 @@ impl Server {
                 }
             }
             method => match method.as_str() {
+                "ROUTERCLOUDSAVE" => {
+                    if !allow_routercloud_edit {
+                        status_forbid(&mut res);
+                    } else if is_miss || !is_file {
+                        status_not_found(&mut res);
+                    } else if size > EDITABLE_TEXT_MAX_SIZE {
+                        *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                        *res.body_mut() = body_full("Payload Too Large");
+                    } else {
+                        self.handle_routercloud_save(path, req, &mut res)
+                            .await?;
+                    }
+                }
                 "PROPFIND" => {
                     if is_dir {
                         let access_paths =
@@ -790,6 +806,121 @@ impl Server {
 
         *res.status_mut() = status;
 
+        Ok(())
+    }
+
+    async fn handle_routercloud_save(
+        &self,
+        path: &Path,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let symlink_meta = fs::symlink_metadata(path).await?;
+
+        if symlink_meta.is_symlink() {
+            status_forbid(res);
+            return Ok(());
+        }
+
+        let meta = fs::metadata(path).await?;
+
+        if !meta.is_file() {
+            status_not_found(res);
+            return Ok(());
+        }
+
+        if meta.len() > EDITABLE_TEXT_MAX_SIZE {
+            *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+            *res.body_mut() = body_full("Payload Too Large");
+            return Ok(());
+        }
+
+        let mut current_probe = Vec::new();
+
+        fs::File::open(path)
+            .await?
+            .take(1024)
+            .read_to_end(&mut current_probe)
+            .await?;
+
+        if !content_inspector::inspect(&current_probe).is_text() {
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+            *res.body_mut() = body_full("File is not editable text");
+            return Ok(());
+        }
+
+        if let Some(content_length) = req.headers().get(CONTENT_LENGTH) {
+            let content_length = match content_length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                Some(value) => value,
+                None => {
+                    status_bad_request(res, "Invalid Content-Length");
+                    return Ok(());
+                }
+            };
+
+            if content_length > ROUTERCLOUD_EDIT_BODY_MAX {
+                *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                *res.body_mut() = body_full("Payload Too Large");
+                return Ok(());
+            }
+        }
+
+        let mut incoming = req.into_body();
+        let mut body = Vec::new();
+
+        while let Some(frame) = incoming.frame().await {
+            let frame = frame?;
+
+            if let Ok(data) = frame.into_data() {
+                if body.len().saturating_add(data.len())
+                    > ROUTERCLOUD_EDIT_BODY_MAX
+                {
+                    *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                    *res.body_mut() = body_full("Payload Too Large");
+                    return Ok(());
+                }
+
+                body.extend_from_slice(&data);
+            }
+        }
+
+        if !content_inspector::inspect(&body).is_text() {
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+            *res.body_mut() = body_full("Body is not text");
+            return Ok(());
+        }
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("Missing parent directory"))?;
+
+        let temp_path = parent.join(
+            format!(".routercloud-save-{}.tmp", Uuid::new_v4())
+        );
+
+        let permissions = meta.permissions();
+
+        if let Err(err) = fs::write(&temp_path, &body).await {
+            return Err(err.into());
+        }
+
+        if let Err(err) =
+            fs::set_permissions(&temp_path, permissions).await
+        {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(err.into());
+        }
+
+        if let Err(err) = fs::rename(&temp_path, path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(err.into());
+        }
+
+        status_no_content(res);
         Ok(())
     }
 
@@ -1266,6 +1397,7 @@ impl Server {
             uri_prefix: self.args.uri_prefix.clone(),
             allow_upload: self.args.allow_upload,
             allow_delete: self.args.allow_delete,
+            routercloud_allow_edit: self.args.routercloud_allow_edit,
             auth: self.args.auth.has_users(),
             user,
             editable,
@@ -2128,6 +2260,7 @@ struct EditData {
     uri_prefix: String,
     allow_upload: bool,
     allow_delete: bool,
+    routercloud_allow_edit: bool,
     auth: bool,
     user: Option<String>,
     editable: bool,

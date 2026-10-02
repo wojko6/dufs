@@ -1265,8 +1265,7 @@ impl Server {
             kind,
             uri_prefix: self.args.uri_prefix.clone(),
             allow_upload: self.args.allow_upload,
-            allow_delete: self.args.allow_delete
-                || self.args.routercloud_allow_delete,
+            allow_delete: self.args.allow_delete,
             auth: self.args.auth.has_users(),
             user,
             editable,
@@ -1550,9 +1549,9 @@ impl Server {
             uri_prefix: self.args.uri_prefix.clone(),
             allow_upload: self.args.allow_upload && readwrite,
             allow_move: self.args.allow_move && readwrite,
-            allow_delete: (self.args.allow_delete
-                || self.args.routercloud_allow_delete)
-                && readwrite,
+            allow_delete: self.args.allow_delete && readwrite,
+            routercloud_allow_delete:
+                self.args.routercloud_allow_delete && readwrite,
             allow_search: self.args.allow_search,
             allow_archive: self.args.allow_archive,
             dir_exists: exist,
@@ -1997,6 +1996,7 @@ pub struct IndexData {
     pub allow_upload: bool,
     pub allow_move: bool,
     pub allow_delete: bool,
+    pub routercloud_allow_delete: bool,
     pub allow_search: bool,
     pub allow_archive: bool,
     pub dir_exists: bool,

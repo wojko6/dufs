@@ -131,6 +131,56 @@ impl AccessControl {
         }
     }
 
+    /// Authenticate the real HTTP request method while authorizing
+    /// the resulting operation as read-only.
+    ///
+    /// RouterCloud selected ZIP uses POST only to carry the selected paths,
+    /// but it must retain GET-level filesystem permissions.
+    pub fn guard_read_action(
+        &self,
+        path: &str,
+        request_method: &Method,
+        authorization: Option<&HeaderValue>,
+    ) -> (Option<String>, Option<AccessPaths>) {
+        if self.empty {
+            return (
+                None,
+                Some(AccessPaths::new(AccessPerm::ReadWrite)),
+            );
+        }
+
+        if let Some(authorization) = authorization {
+            if let Some(user) = get_auth_user(authorization) {
+                if let Some((pass, ap)) = self.users.get(&user) {
+                    if check_auth(
+                        authorization,
+                        request_method.as_str(),
+                        &user,
+                        pass,
+                    )
+                    .is_some()
+                    {
+                        return (
+                            Some(user),
+                            ap.guard(path, &Method::GET),
+                        );
+                    }
+                }
+            }
+
+            return (None, None);
+        }
+
+        if let Some(ap) = self.anonymous.as_ref() {
+            return (
+                None,
+                ap.guard(path, &Method::GET),
+            );
+        }
+
+        (None, None)
+    }
+
     /// Generate a RouterCloud browser-session token.
     ///
     /// The token contains no password. It is signed with a key derived from
@@ -841,6 +891,56 @@ mod tests {
         assert_eq!(
             paths.find("dir2/dir23//dir231/file"),
             Some(AccessPaths::new(AccessPerm::ReadWrite))
+        );
+    }
+
+    #[test]
+    fn test_routercloud_read_action_uses_request_method_for_auth() {
+        let auth =
+            AccessControl::new(
+                &["alice:secret@/:ro"]
+            )
+            .unwrap();
+
+        let encoded =
+            STANDARD.encode("alice:secret");
+
+        let authorization =
+            HeaderValue::from_str(
+                &format!("Basic {encoded}")
+            )
+            .unwrap();
+
+        // Ordinary POST is a write operation and must be denied
+        // for a read-only account.
+        let (_, normal_post) =
+            auth.guard(
+                "/",
+                &Method::POST,
+                Some(&authorization),
+                None,
+                false,
+            );
+
+        assert!(normal_post.is_none());
+
+        // Selected archive authenticates the actual POST request,
+        // but authorizes access to the path as a read operation.
+        let (user, read_action) =
+            auth.guard_read_action(
+                "/",
+                &Method::POST,
+                Some(&authorization),
+            );
+
+        assert_eq!(
+            user.as_deref(),
+            Some("alice")
+        );
+
+        assert_eq!(
+            read_action.map(|paths| paths.perm()),
+            Some(AccessPerm::ReadOnly)
         );
     }
 

@@ -34,7 +34,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
@@ -73,8 +73,33 @@ const ROUTERCLOUD_SESSION_COOKIE: &str = "__Host-routercloud_session";
 const ROUTERCLOUD_SESSION_MAX_AGE: u64 = 60 * 60 * 12;
 const ROUTERCLOUD_LOGIN_BODY_MAX: usize = 8192;
 const ROUTERCLOUD_EDIT_BODY_MAX: usize = EDITABLE_TEXT_MAX_SIZE as usize;
+const ROUTERCLOUD_ZIP_SELECTION_BODY_MAX: usize = 65536;
 
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
+
+
+fn valid_routercloud_zip_selection_path(value: &str) -> bool {
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+        return false;
+    }
+
+    let path = Path::new(value);
+
+    if path.is_absolute() {
+        return false;
+    }
+
+    let mut count = 0usize;
+
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => count += 1,
+            _ => return false,
+        }
+    }
+
+    count > 0
+}
 
 
 fn compute_assets_revision(assets_path: Option<&Path>) -> String {
@@ -380,40 +405,105 @@ impl Server {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
-        let explicit_token = method == Method::GET && query_params.contains_key("token");
+        let is_routercloud_zip_selection =
+            method == Method::POST
+                && has_query_flag(
+                    &query_params,
+                    "zip-selected",
+                );
 
-        let guard = if authorization.is_some() || explicit_token {
-            self.args.auth.guard(
-                &relative_path,
-                &method,
-                authorization,
-                query_params.get("token"),
-                is_microsoft_webdav,
-            )
-        } else if let Some(session_token) =
-            get_cookie_value(headers, ROUTERCLOUD_SESSION_COOKIE)
-        {
-            match self.args.auth.verify_session_token(session_token) {
-                Ok((user, access_paths)) => {
-                    (Some(user), access_paths.guard(&relative_path, &method))
+        let explicit_token =
+            method == Method::GET
+                && query_params.contains_key("token");
+
+        let guard =
+            if is_routercloud_zip_selection {
+                if authorization.is_some() {
+                    self.args
+                        .auth
+                        .guard_read_action(
+                            &relative_path,
+                            &method,
+                            authorization,
+                        )
+                } else if let Some(session_token) =
+                    get_cookie_value(
+                        headers,
+                        ROUTERCLOUD_SESSION_COOKIE,
+                    )
+                {
+                    match self
+                        .args
+                        .auth
+                        .verify_session_token(session_token)
+                    {
+                        Ok((user, access_paths)) => (
+                            Some(user),
+                            access_paths.guard(
+                                &relative_path,
+                                &Method::GET,
+                            ),
+                        ),
+                        Err(_) => self.args
+                            .auth
+                            .guard_read_action(
+                                &relative_path,
+                                &method,
+                                None,
+                            ),
+                    }
+                } else {
+                    self.args
+                        .auth
+                        .guard_read_action(
+                            &relative_path,
+                            &method,
+                            None,
+                        )
                 }
-                Err(_) => self.args.auth.guard(
+            } else if authorization.is_some() || explicit_token {
+                self.args.auth.guard(
+                    &relative_path,
+                    &method,
+                    authorization,
+                    query_params.get("token"),
+                    is_microsoft_webdav,
+                )
+            } else if let Some(session_token) =
+                get_cookie_value(
+                    headers,
+                    ROUTERCLOUD_SESSION_COOKIE,
+                )
+            {
+                match self
+                    .args
+                    .auth
+                    .verify_session_token(session_token)
+                {
+                    Ok((user, access_paths)) => (
+                        Some(user),
+                        access_paths.guard(
+                            &relative_path,
+                            &method,
+                        ),
+                    ),
+                    Err(_) => self.args.auth.guard(
+                        &relative_path,
+                        &method,
+                        None,
+                        None,
+                        is_microsoft_webdav,
+                    ),
+                }
+            } else {
+                self.args.auth.guard(
                     &relative_path,
                     &method,
                     None,
                     None,
                     is_microsoft_webdav,
-                ),
-            }
-        } else {
-            self.args.auth.guard(
-                &relative_path,
-                &method,
-                None,
-                None,
-                is_microsoft_webdav,
-            )
-        };
+                )
+            };
 
         let (user, access_paths) = match guard {
             (None, None) => {
@@ -512,6 +602,23 @@ impl Server {
         if self.guard_root_contained(path).await {
             self.handle_not_found(&query_params, headers, head_only, &mut res)
                 .await?;
+            return Ok(res);
+        }
+
+        if is_routercloud_zip_selection {
+            if !allow_archive || !is_dir {
+                status_not_found(&mut res);
+                return Ok(res);
+            }
+
+            self.handle_routercloud_zip_selection(
+                path,
+                req,
+                access_paths,
+                &mut res,
+            )
+            .await?;
+
             return Ok(res);
         }
 
@@ -923,6 +1030,315 @@ impl Server {
         status_no_content(res);
         Ok(())
     }
+
+    async fn handle_routercloud_zip_selection(
+        &self,
+        dir: &Path,
+        req: Request,
+        access_paths: AccessPaths,
+        res: &mut Response,
+    ) -> Result<()> {
+        let content_type = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        let media_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim();
+
+        if !media_type.eq_ignore_ascii_case(
+            "application/x-www-form-urlencoded",
+        ) {
+            *res.status_mut() =
+                StatusCode::UNSUPPORTED_MEDIA_TYPE;
+
+            *res.body_mut() =
+                body_full("Unsupported Media Type");
+
+            return Ok(());
+        }
+
+        if let Some(content_length) =
+            req.headers().get(CONTENT_LENGTH)
+        {
+            let content_length = match content_length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                Some(value) => value,
+                None => {
+                    status_bad_request(
+                        res,
+                        "Invalid Content-Length",
+                    );
+
+                    return Ok(());
+                }
+            };
+
+            if content_length
+                > ROUTERCLOUD_ZIP_SELECTION_BODY_MAX
+            {
+                *res.status_mut() =
+                    StatusCode::PAYLOAD_TOO_LARGE;
+
+                *res.body_mut() =
+                    body_full("Payload Too Large");
+
+                return Ok(());
+            }
+        }
+
+        let mut incoming = req.into_body();
+        let mut body = Vec::new();
+
+        while let Some(frame) = incoming.frame().await {
+            let frame = frame?;
+
+            if let Ok(data) = frame.into_data() {
+                if body
+                    .len()
+                    .saturating_add(data.len())
+                    > ROUTERCLOUD_ZIP_SELECTION_BODY_MAX
+                {
+                    *res.status_mut() =
+                        StatusCode::PAYLOAD_TOO_LARGE;
+
+                    *res.body_mut() =
+                        body_full("Payload Too Large");
+
+                    return Ok(());
+                }
+
+                body.extend_from_slice(&data);
+            }
+        }
+
+        let selection_json =
+            form_urlencoded::parse(&body)
+                .find_map(|(key, value)| {
+                    if key == "selection" {
+                        Some(value.into_owned())
+                    } else {
+                        None
+                    }
+                });
+
+        let selection_json = match selection_json {
+            Some(value) => value,
+            None => {
+                status_bad_request(
+                    res,
+                    "Missing selection",
+                );
+
+                return Ok(());
+            }
+        };
+
+        let selection: Vec<String> =
+            match serde_json::from_str(&selection_json) {
+                Ok(value) => value,
+                Err(_) => {
+                    status_bad_request(
+                        res,
+                        "Invalid selection",
+                    );
+
+                    return Ok(());
+                }
+            };
+
+        if selection.is_empty() {
+            status_bad_request(
+                res,
+                "Empty selection",
+            );
+
+            return Ok(());
+        }
+
+        if selection.len()
+            > MAX_SUBPATHS_COUNT as usize
+        {
+            *res.status_mut() =
+                StatusCode::PAYLOAD_TOO_LARGE;
+
+            *res.body_mut() =
+                body_full("Too many selected paths");
+
+            return Ok(());
+        }
+
+        let mut unique_names = HashSet::new();
+        let mut selected = Vec::new();
+
+        for name in selection {
+            if !valid_routercloud_zip_selection_path(
+                &name,
+            ) {
+                status_bad_request(
+                    res,
+                    "Invalid selected path",
+                );
+
+                return Ok(());
+            }
+
+            if !unique_names.insert(name.clone()) {
+                continue;
+            }
+
+            let selected_access =
+                match access_paths.guard(
+                    &name,
+                    &Method::GET,
+                ) {
+                    Some(value) => value,
+                    None => {
+                        status_forbid(res);
+                        return Ok(());
+                    }
+                };
+
+            let selected_path =
+                dir.join(Path::new(&name));
+
+            if self
+                .guard_root_contained(&selected_path)
+                .await
+            {
+                status_forbid(res);
+                return Ok(());
+            }
+
+            let meta =
+                match fs::metadata(&selected_path).await {
+                    Ok(value) => value,
+                    Err(err)
+                        if err.kind()
+                            == std::io::ErrorKind::NotFound =>
+                    {
+                        status_not_found(res);
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+
+            let is_dir = meta.is_dir();
+            let is_file = meta.is_file();
+
+            if !is_dir && !is_file {
+                status_bad_request(
+                    res,
+                    "Unsupported selected path",
+                );
+
+                return Ok(());
+            }
+
+            if is_hidden(
+                &self.args.hidden,
+                get_file_name(&selected_path),
+                is_dir,
+            ) {
+                status_not_found(res);
+                return Ok(());
+            }
+
+            selected.push((
+                selected_path,
+                selected_access,
+                is_dir,
+            ));
+        }
+
+        if selected.is_empty() {
+            status_bad_request(
+                res,
+                "Empty selection",
+            );
+
+            return Ok(());
+        }
+
+        let (mut writer, reader) =
+            tokio::io::duplex(BUF_SIZE);
+
+        let dirname =
+            try_get_file_name(dir)?;
+
+        set_content_disposition(
+            res,
+            false,
+            &format!(
+                "{dirname}-zaznaczone.zip"
+            ),
+        )?;
+
+        res.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static(
+                "application/zip",
+            ),
+        );
+
+        let base_dir = dir.to_owned();
+        let hidden = self.args.hidden.clone();
+        let running = self.running.clone();
+
+        let compression =
+            self.args.compress.to_compression();
+
+        let follow_symlinks =
+            self.args.allow_symlink;
+
+        let serve_path =
+            self.args.serve_path.clone();
+
+        tokio::spawn(async move {
+            if let Err(err) = zip_selected(
+                &mut writer,
+                &base_dir,
+                selected,
+                &hidden,
+                compression,
+                follow_symlinks,
+                serve_path,
+                running,
+            )
+            .await
+            {
+                error!(
+                    "Failed to zip RouterCloud selection: {err}"
+                );
+            }
+        });
+
+        let reader_stream =
+            ReaderStream::with_capacity(
+                reader,
+                BUF_SIZE,
+            );
+
+        let stream_body =
+            StreamBody::new(
+                reader_stream
+                    .map_ok(Frame::data)
+                    .map_err(|err| anyhow!("{err}")),
+            );
+
+        *res.body_mut() =
+            stream_body.boxed();
+
+        Ok(())
+    }
+
 
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
         match is_dir {
@@ -2323,6 +2739,133 @@ fn res_multistatus(res: &mut Response, content: &str) {
     ));
 }
 
+async fn zip_selected<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    base_dir: &Path,
+    selected: Vec<(PathBuf, AccessPaths, bool)>,
+    hidden: &[String],
+    compression: Compression,
+    follow_symlinks: bool,
+    serve_path: PathBuf,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut writer = ZipFileWriter::with_tokio(writer);
+    let hidden = Arc::new(hidden.to_vec());
+    let mut seen_paths = HashSet::new();
+
+    for (selected_path, selected_access, is_dir) in selected {
+        let zip_paths = if is_dir {
+            let mut paths =
+                vec![selected_path.clone()];
+
+            let mut descendants =
+                tokio::task::spawn(
+                    collect_dir_entries(
+                        selected_access,
+                        running.clone(),
+                        selected_path.clone(),
+                        hidden.clone(),
+                        follow_symlinks,
+                        serve_path.clone(),
+                        move |entry| {
+                            entry.path()
+                                .symlink_metadata()
+                                .is_ok()
+                                && (
+                                    entry.file_type().is_file()
+                                    || entry.file_type().is_dir()
+                                )
+                        },
+                    ),
+                )
+                .await?;
+
+            paths.append(&mut descendants);
+
+            paths
+        } else {
+            vec![selected_path]
+        };
+
+        for zip_path in zip_paths {
+            if !seen_paths.insert(zip_path.clone()) {
+                continue;
+            }
+
+            let meta =
+                fs::metadata(&zip_path).await?;
+
+            let is_dir =
+                meta.is_dir();
+
+            let mut filename = match zip_path
+                .strip_prefix(base_dir)
+                .ok()
+                .and_then(|value| value.to_str())
+                .map(|value| value.replace(MAIN_SEPARATOR, "/"))
+            {
+                Some(value) if !value.is_empty() => value,
+                _ => continue,
+            };
+
+            if is_dir && !filename.ends_with('/') {
+                filename.push('/');
+            }
+
+            let (datetime, mode) =
+                get_file_mtime_and_mode(&zip_path).await?;
+
+            let builder =
+                ZipEntryBuilder::new(
+                    filename.into(),
+                    compression,
+                )
+                .unix_permissions(mode)
+                .last_modification_date(
+                    ZipDateTime::from_chrono(
+                        &datetime
+                    ),
+                );
+
+            if is_dir {
+                writer
+                    .write_entry_whole(
+                        builder,
+                        &[],
+                    )
+                    .await?;
+
+                continue;
+            }
+
+            let mut file =
+                File::open(&zip_path).await?;
+
+            let mut file_writer =
+                writer
+                    .write_entry_stream(builder)
+                    .await?
+                    .compat_write();
+
+            io::copy(
+                &mut file,
+                &mut file_writer,
+            )
+            .await?;
+
+            file_writer
+                .into_inner()
+                .close()
+                .await?;
+        }
+    }
+
+    writer.close().await?;
+
+    Ok(())
+}
+
+
 async fn zip_dir<W: AsyncWrite + Unpin>(
     writer: &mut W,
     dir: &Path,
@@ -2652,6 +3195,59 @@ where
 #[cfg(test)]
 mod routercloud_session_http_tests {
     use super::*;
+
+    #[test]
+    fn test_routercloud_zip_selection_path_validation() {
+        assert!(
+            valid_routercloud_zip_selection_path(
+                "plik.txt"
+            )
+        );
+
+        assert!(
+            valid_routercloud_zip_selection_path(
+                "folder/plik.txt"
+            )
+        );
+
+        assert!(
+            valid_routercloud_zip_selection_path(
+                "Zażółć gęślą jaźń.txt"
+            )
+        );
+
+        assert!(
+            !valid_routercloud_zip_selection_path("")
+        );
+
+        assert!(
+            !valid_routercloud_zip_selection_path(
+                "/etc/passwd"
+            )
+        );
+
+        assert!(
+            !valid_routercloud_zip_selection_path(
+                "../secret"
+            )
+        );
+
+        assert!(
+            !valid_routercloud_zip_selection_path(
+                "folder/../secret"
+            )
+        );
+
+        assert!(
+            !valid_routercloud_zip_selection_path(".")
+        );
+
+        assert!(
+            !valid_routercloud_zip_selection_path(
+                "./plik.txt"
+            )
+        );
+    }
 
     #[test]
     fn test_routercloud_cookie_parser() {

@@ -64,6 +64,13 @@ const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
+
+const ROUTERCLOUD_LOGIN_PATH: &str = "/__routercloud/login";
+const ROUTERCLOUD_LOGOUT_PATH: &str = "/__routercloud/logout";
+const ROUTERCLOUD_SESSION_COOKIE: &str = "__Host-routercloud_session";
+const ROUTERCLOUD_SESSION_MAX_AGE: u64 = 60 * 60 * 12;
+const ROUTERCLOUD_LOGIN_BODY_MAX: usize = 8192;
+
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
 
@@ -261,6 +268,30 @@ impl Server {
     pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
         let mut res = Response::default();
 
+        if req.uri().path() == ROUTERCLOUD_LOGIN_PATH {
+            if req.method() != Method::POST {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                res.headers_mut()
+                    .insert("allow", HeaderValue::from_static("POST"));
+                return Ok(res);
+            }
+
+            self.handle_routercloud_login(req, &mut res).await?;
+            return Ok(res);
+        }
+
+        if req.uri().path() == ROUTERCLOUD_LOGOUT_PATH {
+            if req.method() != Method::POST {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                res.headers_mut()
+                    .insert("allow", HeaderValue::from_static("POST"));
+                return Ok(res);
+            }
+
+            self.handle_routercloud_logout(&mut res)?;
+            return Ok(res);
+        }
+
         let req_path = req.uri().path();
         let headers = req.headers();
         let method = req.method().clone();
@@ -302,13 +333,40 @@ impl Server {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
-        let guard = self.args.auth.guard(
-            &relative_path,
-            &method,
-            authorization,
-            query_params.get("token"),
-            is_microsoft_webdav,
-        );
+        let explicit_token = method == Method::GET && query_params.contains_key("token");
+
+        let guard = if authorization.is_some() || explicit_token {
+            self.args.auth.guard(
+                &relative_path,
+                &method,
+                authorization,
+                query_params.get("token"),
+                is_microsoft_webdav,
+            )
+        } else if let Some(session_token) =
+            get_cookie_value(headers, ROUTERCLOUD_SESSION_COOKIE)
+        {
+            match self.args.auth.verify_session_token(session_token) {
+                Ok((user, access_paths)) => {
+                    (Some(user), access_paths.guard(&relative_path, &method))
+                }
+                Err(_) => self.args.auth.guard(
+                    &relative_path,
+                    &method,
+                    None,
+                    None,
+                    is_microsoft_webdav,
+                ),
+            }
+        } else {
+            self.args.auth.guard(
+                &relative_path,
+                &method,
+                None,
+                None,
+                is_microsoft_webdav,
+            )
+        };
 
         let (user, access_paths) = match guard {
             (None, None) => {
@@ -1476,6 +1534,140 @@ impl Server {
         Ok(())
     }
 
+    async fn handle_routercloud_login(
+        &self,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        routercloud_auth_no_store(res);
+
+        let content_type = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        let media_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim();
+
+        if !media_type.eq_ignore_ascii_case(
+            "application/x-www-form-urlencoded",
+        ) {
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+            *res.body_mut() = body_full("Unsupported Media Type");
+            return Ok(());
+        }
+
+        if let Some(content_length) = req.headers().get(CONTENT_LENGTH) {
+            let content_length = match content_length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                Some(value) => value,
+                None => {
+                    status_bad_request(res, "Invalid Content-Length");
+                    return Ok(());
+                }
+            };
+
+            if content_length > ROUTERCLOUD_LOGIN_BODY_MAX {
+                *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                *res.body_mut() = body_full("Payload Too Large");
+                return Ok(());
+            }
+        }
+
+        let mut incoming = req.into_body();
+        let mut body = Vec::new();
+
+        while let Some(frame) = incoming.frame().await {
+            let frame = frame?;
+
+            if let Ok(data) = frame.into_data() {
+                if body.len().saturating_add(data.len())
+                    > ROUTERCLOUD_LOGIN_BODY_MAX
+                {
+                    *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                    *res.body_mut() = body_full("Payload Too Large");
+                    return Ok(());
+                }
+
+                body.extend_from_slice(&data);
+            }
+        }
+
+        let fields: HashMap<String, String> =
+            form_urlencoded::parse(&body)
+                .into_owned()
+                .collect();
+
+        let username = fields
+            .get("username")
+            .map(String::as_str)
+            .unwrap_or_default();
+
+        let password = fields
+            .get("password")
+            .map(String::as_str)
+            .unwrap_or_default();
+
+        if username.is_empty() || password.is_empty() {
+            status_bad_request(res, "Missing credentials");
+            return Ok(());
+        }
+
+        if self
+            .args
+            .auth
+            .authenticate_password(username, password)
+            .is_none()
+        {
+            // Deliberately do not send WWW-Authenticate here.
+            // A browser must not open its native Basic Auth dialog.
+            *res.status_mut() = StatusCode::UNAUTHORIZED;
+            *res.body_mut() = body_full("Invalid username or password");
+            return Ok(());
+        }
+
+        let token = self
+            .args
+            .auth
+            .generate_session_token(username)?;
+
+        let cookie = routercloud_session_cookie(&token);
+
+        res.headers_mut()
+            .insert("set-cookie", HeaderValue::from_str(&cookie)?);
+
+        *res.status_mut() = StatusCode::NO_CONTENT;
+
+        Ok(())
+    }
+
+    fn handle_routercloud_logout(
+        &self,
+        res: &mut Response,
+    ) -> Result<()> {
+        routercloud_auth_no_store(res);
+
+        res.headers_mut().insert(
+            "set-cookie",
+            HeaderValue::from_static(
+                "__Host-routercloud_session=; Path=/; Max-Age=0; \
+HttpOnly; Secure; SameSite=Strict; \
+Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            ),
+        );
+
+        *res.status_mut() = StatusCode::NO_CONTENT;
+
+        Ok(())
+    }
+
     fn auth_reject(&self, res: &mut Response) -> Result<()> {
         set_webdav_headers(res);
 
@@ -1521,10 +1713,29 @@ impl Server {
         };
 
         let authorization = headers.get(AUTHORIZATION);
-        let guard = self
-            .args
-            .auth
-            .guard(&dest_path, req.method(), authorization, None, false);
+
+        let guard = if authorization.is_some() {
+            self.args
+                .auth
+                .guard(&dest_path, req.method(), authorization, None, false)
+        } else if let Some(session_token) =
+            get_cookie_value(headers, ROUTERCLOUD_SESSION_COOKIE)
+        {
+            match self.args.auth.verify_session_token(session_token) {
+                Ok((user, access_paths)) => {
+                    (Some(user), access_paths.guard(&dest_path, req.method()))
+                }
+                Err(_) => {
+                    self.args
+                        .auth
+                        .guard(&dest_path, req.method(), None, None, false)
+                }
+            }
+        } else {
+            self.args
+                .auth
+                .guard(&dest_path, req.method(), None, None, false)
+        };
 
         match guard {
             (_, Some(_)) => {}
@@ -1939,6 +2150,48 @@ fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
     Some((etag, last_modified))
 }
 
+fn get_cookie_value<'a>(
+    headers: &'a HeaderMap<HeaderValue>,
+    name: &str,
+) -> Option<&'a str> {
+    for header in headers.get_all("cookie").iter() {
+        let Ok(value) = header.to_str() else {
+            continue;
+        };
+
+        for item in value.split(';') {
+            let Some((key, value)) = item.trim().split_once('=') else {
+                continue;
+            };
+
+            if key == name {
+                return Some(value);
+            }
+        }
+    }
+
+    None
+}
+
+fn routercloud_session_cookie(token: &str) -> String {
+    format!(
+        "{ROUTERCLOUD_SESSION_COOKIE}={token}; \
+Path=/; Max-Age={ROUTERCLOUD_SESSION_MAX_AGE}; \
+HttpOnly; Secure; SameSite=Strict"
+    )
+}
+
+fn routercloud_auth_no_store(res: &mut Response) {
+    res.headers_mut().insert(
+        "cache-control",
+        HeaderValue::from_static("no-store"),
+    );
+    res.headers_mut().insert(
+        "pragma",
+        HeaderValue::from_static("no-cache"),
+    );
+}
+
 fn status_forbid(res: &mut Response) {
     *res.status_mut() = StatusCode::FORBIDDEN;
     *res.body_mut() = body_full("Forbidden");
@@ -2130,4 +2383,52 @@ where
         }
     }
     paths
+}
+
+
+#[cfg(test)]
+mod routercloud_session_http_tests {
+    use super::*;
+
+    #[test]
+    fn test_routercloud_cookie_parser() {
+        let mut headers = HeaderMap::new();
+
+        headers.insert(
+            "cookie",
+            HeaderValue::from_static(
+                "theme=dark; __Host-routercloud_session=abc123; language=pl",
+            ),
+        );
+
+        assert_eq!(
+            get_cookie_value(
+                &headers,
+                ROUTERCLOUD_SESSION_COOKIE
+            ),
+            Some("abc123")
+        );
+
+        assert_eq!(
+            get_cookie_value(&headers, "missing"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_routercloud_session_cookie_security_flags() {
+        let cookie = routercloud_session_cookie("token123");
+
+        assert!(cookie.starts_with(
+            "__Host-routercloud_session=token123;"
+        ));
+
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("Max-Age=43200"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("SameSite=Strict"));
+
+        assert!(!cookie.contains("Domain="));
+    }
 }

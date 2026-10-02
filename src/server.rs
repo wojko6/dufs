@@ -66,6 +66,8 @@ const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 
 const ROUTERCLOUD_LOGIN_PATH: &str = "/__routercloud/login";
+const ROUTERCLOUD_LOGIN_CSS_PATH: &str = "/__routercloud/login.css";
+const ROUTERCLOUD_LOGIN_JS_PATH: &str = "/__routercloud/login.js";
 const ROUTERCLOUD_LOGOUT_PATH: &str = "/__routercloud/logout";
 const ROUTERCLOUD_SESSION_COOKIE: &str = "__Host-routercloud_session";
 const ROUTERCLOUD_SESSION_MAX_AGE: u64 = 60 * 60 * 12;
@@ -269,14 +271,58 @@ impl Server {
         let mut res = Response::default();
 
         if req.uri().path() == ROUTERCLOUD_LOGIN_PATH {
-            if req.method() != Method::POST {
-                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                res.headers_mut()
-                    .insert("allow", HeaderValue::from_static("POST"));
+            if req.method() == Method::GET {
+                self.handle_routercloud_login_asset(
+                    "login.html",
+                    req.headers(),
+                    &mut res,
+                )
+                .await?;
                 return Ok(res);
             }
 
-            self.handle_routercloud_login(req, &mut res).await?;
+            if req.method() == Method::POST {
+                self.handle_routercloud_login(req, &mut res).await?;
+                return Ok(res);
+            }
+
+            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            res.headers_mut()
+                .insert("allow", HeaderValue::from_static("GET, POST"));
+            return Ok(res);
+        }
+
+        if req.uri().path() == ROUTERCLOUD_LOGIN_CSS_PATH {
+            if req.method() != Method::GET {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                res.headers_mut()
+                    .insert("allow", HeaderValue::from_static("GET"));
+                return Ok(res);
+            }
+
+            self.handle_routercloud_login_asset(
+                "login.css",
+                req.headers(),
+                &mut res,
+            )
+            .await?;
+            return Ok(res);
+        }
+
+        if req.uri().path() == ROUTERCLOUD_LOGIN_JS_PATH {
+            if req.method() != Method::GET {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                res.headers_mut()
+                    .insert("allow", HeaderValue::from_static("GET"));
+                return Ok(res);
+            }
+
+            self.handle_routercloud_login_asset(
+                "login.js",
+                req.headers(),
+                &mut res,
+            )
+            .await?;
             return Ok(res);
         }
 
@@ -370,7 +416,17 @@ impl Server {
 
         let (user, access_paths) = match guard {
             (None, None) => {
-                self.auth_reject(&mut res)?;
+                if should_redirect_to_routercloud_login(
+                    headers,
+                    &method,
+                    authorization,
+                    is_microsoft_webdav,
+                ) {
+                    routercloud_login_redirect(&mut res);
+                } else {
+                    self.auth_reject(&mut res)?;
+                }
+
                 return Ok(res);
             }
             (Some(_), None) => {
@@ -1534,6 +1590,37 @@ impl Server {
         Ok(())
     }
 
+    async fn handle_routercloud_login_asset(
+        &self,
+        name: &str,
+        headers: &HeaderMap<HeaderValue>,
+        res: &mut Response,
+    ) -> Result<()> {
+        let Some(assets_path) = self.args.assets.as_ref() else {
+            status_not_found(res);
+            return Ok(());
+        };
+
+        let path = assets_path.join(name);
+
+        if !fs::try_exists(&path).await.unwrap_or_default() {
+            status_not_found(res);
+            return Ok(());
+        }
+
+        self.handle_send_file(
+            &path,
+            headers,
+            false,
+            res,
+        )
+        .await?;
+
+        routercloud_auth_no_store(res);
+
+        Ok(())
+    }
+
     async fn handle_routercloud_login(
         &self,
         req: Request,
@@ -2189,6 +2276,42 @@ fn routercloud_auth_no_store(res: &mut Response) {
     res.headers_mut().insert(
         "pragma",
         HeaderValue::from_static("no-cache"),
+    );
+}
+
+fn should_redirect_to_routercloud_login(
+    headers: &HeaderMap<HeaderValue>,
+    method: &Method,
+    authorization: Option<&HeaderValue>,
+    is_microsoft_webdav: bool,
+) -> bool {
+    if authorization.is_some() || is_microsoft_webdav {
+        return false;
+    }
+
+    if method != Method::GET && method != Method::HEAD {
+        return false;
+    }
+
+    headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|item| item.trim().starts_with("text/html"))
+        })
+        .unwrap_or(false)
+}
+
+fn routercloud_login_redirect(res: &mut Response) {
+    routercloud_auth_no_store(res);
+
+    *res.status_mut() = StatusCode::FOUND;
+
+    res.headers_mut().insert(
+        "location",
+        HeaderValue::from_static(ROUTERCLOUD_LOGIN_PATH),
     );
 }
 

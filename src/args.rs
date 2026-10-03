@@ -318,11 +318,15 @@ pub struct Args {
 
     // ROUTERCLOUD_PASSWORD_RECOVERY_V1
     //
-    // Configuration-only for now:
+    // Configuration-only:
     // routercloud-password-recovery-user
     // routercloud-password-recovery-email
+    // routercloud-password-recovery-mail-config
+    // routercloud-password-recovery-reset-url
     pub routercloud_password_recovery_user: Option<String>,
     pub routercloud_password_recovery_email: Option<String>,
+    pub routercloud_password_recovery_mail_config: Option<PathBuf>,
+    pub routercloud_password_recovery_reset_url: Option<String>,
 
     pub allow_search: bool,
     pub allow_symlink: bool,

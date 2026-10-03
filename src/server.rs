@@ -38,6 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
+use std::process::Stdio;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -46,7 +47,8 @@ use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::{fs, io};
 
@@ -2443,7 +2445,7 @@ impl Server {
          * do generatora wiadomości. Nie zapisujemy go
          * ani do pliku, ani do logów.
          */
-        let (_raw_token, token_sha256) = routercloud_generate_password_reset_token();
+        let (raw_token, token_sha256) = routercloud_generate_password_reset_token();
 
         let store = RouterCloudPasswordResetStore {
             version: ROUTERCLOUD_PASSWORD_RESET_VERSION,
@@ -2457,8 +2459,138 @@ impl Server {
             expires_at_ms: now_ms.saturating_add(ROUTERCLOUD_PASSWORD_RESET_TTL_MS),
         };
 
-        self.save_routercloud_password_reset(configured_user, &store)
-            .await?;
+        /*
+         * Save the hash before sending the message.
+         * If SMTP succeeds, the received link is already
+         * backed by persistent reset state.
+         */
+        if let Err(err) = self
+            .save_routercloud_password_reset(configured_user, &store)
+            .await
+        {
+            log::warn!("RouterCloud password reset state write failed: {err}");
+
+            return Ok(());
+        }
+
+        if let Err(err) = self
+            .send_routercloud_password_reset_mail(configured_email, &raw_token)
+            .await
+        {
+            /*
+             * Do not leave a usable reset token behind
+             * when no message was delivered.
+             */
+            if let Ok(path) = self.routercloud_password_reset_store_path(configured_user) {
+                if let Err(remove_err) = fs::remove_file(&path).await {
+                    if remove_err.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!("RouterCloud password reset cleanup failed");
+                    }
+                }
+            }
+
+            /*
+             * Client response deliberately remains
+             * the same neutral 204 response.
+             * Never include the raw token in this log.
+             */
+            log::warn!("RouterCloud password reset mail delivery failed: {err}");
+
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
+    // ROUTERCLOUD_PASSWORD_RESET_SMTP_V1
+    async fn send_routercloud_password_reset_mail(
+        &self,
+        email: &str,
+        raw_token: &str,
+    ) -> Result<()> {
+        let mail_config = self
+            .args
+            .routercloud_password_recovery_mail_config
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!("RouterCloud password recovery mail transport is not configured")
+            })?;
+
+        let reset_url = self
+            .args
+            .routercloud_password_recovery_reset_url
+            .as_deref()
+            .ok_or_else(|| anyhow!("RouterCloud password recovery reset URL is not configured"))?;
+
+        let canonical_mail_config = fs::canonicalize(mail_config).await?;
+
+        /*
+         * SMTP credentials must never live below
+         * the directory exported by RouterCloud.
+         */
+        if canonical_mail_config.starts_with(&self.args.serve_path) {
+            return Err(anyhow!(
+                "RouterCloud SMTP config must be outside serve path"
+            ));
+        }
+
+        let metadata = fs::metadata(&canonical_mail_config).await?;
+
+        if !metadata.is_file() {
+            return Err(anyhow!("RouterCloud SMTP config is not a regular file"));
+        }
+
+        #[cfg(unix)]
+        {
+            let mode = metadata.permissions().mode();
+
+            if mode & 0o077 != 0 {
+                return Err(anyhow!("RouterCloud SMTP config permissions are too broad"));
+            }
+        }
+
+        let message = routercloud_password_reset_mail_message(email, reset_url, raw_token)?;
+
+        /*
+         * The raw token is sent through stdin.
+         * It never appears in process arguments
+         * or RouterCloud HTTP logs.
+         */
+        let mut child = Command::new("/opt/bin/curl")
+            .arg("--config")
+            .arg(&canonical_mail_config)
+            .arg("--mail-rcpt")
+            .arg(email)
+            .arg("--upload-file")
+            .arg("-")
+            .arg("--connect-timeout")
+            .arg("10")
+            .arg("--max-time")
+            .arg("30")
+            .arg("--silent")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| anyhow!("Failed to start RouterCloud SMTP transport: {err}"))?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("RouterCloud SMTP transport stdin unavailable"))?;
+
+        stdin.write_all(message.as_bytes()).await?;
+
+        drop(stdin);
+
+        let status = child.wait().await?;
+
+        if !status.success() {
+            return Err(anyhow!(
+                "RouterCloud SMTP transport failed with exit code {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
 
         Ok(())
     }
@@ -3789,6 +3921,53 @@ fn routercloud_password_reset_token_matches(raw_token: &str, expected_sha256: &s
     diff == 0
 }
 
+// ROUTERCLOUD_PASSWORD_RESET_SMTP_V1
+fn valid_routercloud_password_reset_url(value: &str) -> bool {
+    value.starts_with("https://")
+        && !value.is_empty()
+        && !value.chars().any(|ch| matches!(ch, '\r' | '\n' | '#'))
+}
+
+fn routercloud_password_reset_mail_message(
+    email: &str,
+    reset_url: &str,
+    raw_token: &str,
+) -> Result<String> {
+    if email.is_empty() || email.len() > 320 || email.chars().any(|ch| matches!(ch, '\r' | '\n')) {
+        return Err(anyhow!("Invalid RouterCloud recovery email"));
+    }
+
+    if !valid_routercloud_password_reset_url(reset_url) {
+        return Err(anyhow!("Invalid RouterCloud password reset URL"));
+    }
+
+    if raw_token.len() != 64 || !raw_token.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err(anyhow!("Invalid RouterCloud password reset token"));
+    }
+
+    let link = format!("{reset_url}#reset_token={raw_token}");
+
+    Ok(format!(
+        concat!(
+            "From: RouterCloud <{email}>\\r\\n",
+            "To: <{email}>\\r\\n",
+            "Subject: RouterCloud - zmiana hasla\\r\\n",
+            "MIME-Version: 1.0\\r\\n",
+            "Content-Type: text/plain; charset=UTF-8\\r\\n",
+            "Content-Transfer-Encoding: 8bit\\r\\n",
+            "\\r\\n",
+            "Otrzymalismy prosbe o zmiane hasla do RouterCloud.\\r\\n",
+            "\\r\\n",
+            "Link jest wazny przez 15 minut:\\r\\n",
+            "{link}\\r\\n",
+            "\\r\\n",
+            "Jesli to nie Ty wyslales prosbe, zignoruj te wiadomosc.\\r\\n"
+        ),
+        email = email,
+        link = link,
+    ))
+}
+
 // ROUTERCLOUD_PASSWORD_RECOVERY_V1
 fn routercloud_unix_time_ms() -> u64 {
     SystemTime::now()
@@ -4115,6 +4294,48 @@ mod routercloud_session_http_tests {
         assert!(!valid_routercloud_new_password("abcdefghijk"));
 
         assert!(!valid_routercloud_new_password(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn test_routercloud_password_reset_mail_message() {
+        let token = "a".repeat(64);
+
+        let message = routercloud_password_reset_mail_message(
+            "alice@example.com",
+            "https://cloud.home.arpa/__routercloud/login",
+            &token,
+        )
+        .unwrap();
+
+        assert!(message.contains("To: <alice@example.com>"));
+
+        assert!(message.contains(&format!(
+            "https://cloud.home.arpa/__routercloud/login#reset_token={token}"
+        )));
+
+        assert!(!message.contains("?reset_token="));
+    }
+
+    #[test]
+    fn test_routercloud_password_reset_mail_validation() {
+        assert!(valid_routercloud_password_reset_url(
+            "https://cloud.home.arpa/__routercloud/login"
+        ));
+
+        assert!(!valid_routercloud_password_reset_url(
+            "http://cloud.home.arpa/__routercloud/login"
+        ));
+
+        assert!(!valid_routercloud_password_reset_url(
+            "https://cloud.home.arpa/__routercloud/login#secret"
+        ));
+
+        assert!(routercloud_password_reset_mail_message(
+            "alice\r\nBcc: attacker@example.com",
+            "https://cloud.home.arpa/__routercloud/login",
+            &"a".repeat(64),
+        )
+        .is_err());
     }
 
     #[test]

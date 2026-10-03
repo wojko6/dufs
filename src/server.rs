@@ -4297,11 +4297,7 @@ mod routercloud_session_http_tests {
     #[test]
     fn test_routercloud_email_login_alias_resolution() {
         assert_eq!(
-            resolve_routercloud_login_user(
-                "alice",
-                Some("alice"),
-                Some("alice@example.com"),
-            ),
+            resolve_routercloud_login_user("alice", Some("alice"), Some("alice@example.com"),),
             "alice"
         );
 

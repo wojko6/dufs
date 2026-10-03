@@ -9,10 +9,11 @@ use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use md5::Context;
 use sha2::{Digest, Sha256};
-use sha_crypt::PasswordVerifier;
+use sha_crypt::{PasswordHasher, PasswordVerifier};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 use uuid::Uuid;
 
@@ -35,12 +36,25 @@ lazy_static! {
     };
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AccessControl {
     empty: bool,
     use_hashed_password: bool,
     users: IndexMap<String, (String, AccessPaths)>,
+
+    // ROUTERCLOUD_PASSWORD_OVERRIDE_V1
+    password_overrides: Arc<RwLock<HashMap<String, String>>>,
+
     anonymous: Option<AccessPaths>,
+}
+
+impl PartialEq for AccessControl {
+    fn eq(&self, other: &Self) -> bool {
+        self.empty == other.empty
+            && self.use_hashed_password == other.use_hashed_password
+            && self.users == other.users
+            && self.anonymous == other.anonymous
+    }
 }
 
 impl Default for AccessControl {
@@ -49,6 +63,7 @@ impl Default for AccessControl {
             empty: true,
             use_hashed_password: false,
             users: IndexMap::new(),
+            password_overrides: Arc::new(RwLock::new(HashMap::new())),
             anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
         }
     }
@@ -111,6 +126,7 @@ impl AccessControl {
             empty: false,
             use_hashed_password,
             users,
+            password_overrides: Arc::new(RwLock::new(HashMap::new())),
             anonymous,
         })
     }
@@ -124,12 +140,60 @@ impl AccessControl {
         self.users.contains_key(user)
     }
 
+    // ROUTERCLOUD_PASSWORD_OVERRIDE_V1
+    pub fn set_password_override(&self, user: &str, password_hash: String) -> Result<()> {
+        if !self.users.contains_key(user) {
+            bail!("Not found user '{user}'");
+        }
+
+        if !password_hash.starts_with("$6$") {
+            bail!("Password override must use SHA-512-crypt");
+        }
+
+        let mut overrides = self
+            .password_overrides
+            .write()
+            .map_err(|_| anyhow!("Password override lock poisoned"))?;
+
+        overrides.insert(user.to_string(), password_hash);
+
+        Ok(())
+    }
+
+    pub fn has_password_override(&self, user: &str) -> bool {
+        self.password_overrides
+            .read()
+            .map(|values| values.contains_key(user))
+            .unwrap_or(false)
+    }
+
+    pub fn uses_hashed_password(&self) -> bool {
+        if self.use_hashed_password {
+            return true;
+        }
+
+        self.password_overrides
+            .read()
+            .map(|values| !values.is_empty())
+            .unwrap_or(true)
+    }
+
+    fn effective_password(&self, user: &str, configured: &str) -> String {
+        self.password_overrides
+            .read()
+            .ok()
+            .and_then(|values| values.get(user).cloned())
+            .unwrap_or_else(|| configured.to_string())
+    }
+
     /// Authenticate a username/password pair without exposing the stored
     /// password or password hash to the caller.
     pub fn authenticate_password(&self, user: &str, password: &str) -> Option<AccessPaths> {
         let (stored_password, access_paths) = self.users.get(user)?;
 
-        if verify_password(password, stored_password) {
+        let effective_password = self.effective_password(user, stored_password);
+
+        if verify_password(password, &effective_password) {
             Some(access_paths.clone())
         } else {
             None
@@ -154,7 +218,16 @@ impl AccessControl {
         if let Some(authorization) = authorization {
             if let Some(user) = get_auth_user(authorization) {
                 if let Some((pass, ap)) = self.users.get(&user) {
-                    if check_auth(authorization, request_method.as_str(), &user, pass).is_some() {
+                    let effective_password = self.effective_password(&user, pass);
+
+                    if check_auth(
+                        authorization,
+                        request_method.as_str(),
+                        &user,
+                        &effective_password,
+                    )
+                    .is_some()
+                    {
                         return (Some(user), ap.guard(path, &Method::GET));
                     }
                 }
@@ -186,8 +259,11 @@ impl AccessControl {
             .get(user)
             .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
 
+        let effective_password = self.effective_password(user, stored_password);
+
         let message = format!("{ROUTERCLOUD_SESSION_CONTEXT}:{user}:{exp}");
-        let mut signing_key = derive_secret_key(user, stored_password);
+
+        let mut signing_key = derive_secret_key(user, &effective_password);
         let signature = signing_key.sign(message.as_bytes()).to_bytes();
 
         let mut raw = Vec::with_capacity(1 + 64 + 8 + user.len());
@@ -235,9 +311,11 @@ impl AccessControl {
 
         let signature = Signature::from_bytes(&<[u8; 64]>::try_from(signature_bytes)?);
 
+        let effective_password = self.effective_password(user, stored_password);
+
         let message = format!("{ROUTERCLOUD_SESSION_CONTEXT}:{user}:{exp}");
 
-        derive_secret_key(user, stored_password).verify(message.as_bytes(), &signature)?;
+        derive_secret_key(user, &effective_password).verify(message.as_bytes(), &signature)?;
 
         Ok((user.to_string(), access_paths))
     }
@@ -268,7 +346,12 @@ impl AccessControl {
                     if method == Method::OPTIONS {
                         return (Some(user), Some(AccessPaths::new(AccessPerm::ReadOnly)));
                     }
-                    if check_auth(authorization, method.as_str(), &user, pass).is_some() {
+
+                    let effective_password = self.effective_password(&user, pass);
+
+                    if check_auth(authorization, method.as_str(), &user, &effective_password)
+                        .is_some()
+                    {
                         return (Some(user), ap.guard(path, method));
                     }
                 }
@@ -293,9 +376,13 @@ impl AccessControl {
             .users
             .get(user)
             .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+        let effective_password = self.effective_password(user, pass);
+
         let exp = unix_now().as_millis() as u64 + TOKEN_EXPIRATION;
+
         let message = format!("{path}:{exp}");
-        let mut signing_key = derive_secret_key(user, pass);
+
+        let mut signing_key = derive_secret_key(user, &effective_password);
         let sig = signing_key.sign(message.as_bytes()).to_bytes();
 
         let mut raw = Vec::with_capacity(64 + 8 + user.len());
@@ -330,8 +417,11 @@ impl AccessControl {
 
         let sig = Signature::from_bytes(&<[u8; 64]>::try_from(sig_bytes)?);
 
+        let effective_password = self.effective_password(user, pass);
+
         let message = format!("{path}:{exp}");
-        derive_secret_key(user, pass).verify(message.as_bytes(), &sig)?;
+
+        derive_secret_key(user, &effective_password).verify(message.as_bytes(), &sig)?;
         Ok((user.to_string(), ap))
     }
 }
@@ -513,7 +603,7 @@ impl AccessPerm {
 }
 
 pub fn www_authenticate(res: &mut Response, args: &Args) -> Result<()> {
-    if args.auth.use_hashed_password {
+    if args.auth.uses_hashed_password() {
         let basic = HeaderValue::from_str(&format!("Basic realm=\"{REALM}\""))?;
         res.headers_mut().insert(WWW_AUTHENTICATE, basic);
     } else {
@@ -907,6 +997,42 @@ mod tests {
             read_action.map(|paths| paths.perm()),
             Some(AccessPerm::ReadOnly)
         );
+    }
+
+    #[test]
+    fn test_routercloud_password_override_auth() {
+        let auth = AccessControl::new(&["alice:old-secret@/:rw"]).unwrap();
+
+        assert!(auth.authenticate_password("alice", "old-secret",).is_some());
+
+        let old_session = auth.generate_session_token("alice").unwrap();
+
+        let new_hash = sha_crypt::ShaCrypt::SHA512
+            .hash_password(b"new-secret-1234")
+            .unwrap()
+            .to_string();
+
+        assert!(new_hash.starts_with("$6$"));
+
+        auth.set_password_override("alice", new_hash).unwrap();
+
+        assert!(auth.has_password_override("alice"));
+
+        assert!(auth.authenticate_password("alice", "old-secret",).is_none());
+
+        assert!(auth
+            .authenticate_password("alice", "new-secret-1234",)
+            .is_some());
+
+        /*
+         * Zmiana credentialu musi
+         * unieważnić poprzednią sesję.
+         */
+        assert!(auth.verify_session_token(&old_session).is_err());
+
+        let new_session = auth.generate_session_token("alice").unwrap();
+
+        assert!(auth.verify_session_token(&new_session).is_ok());
     }
 
     #[test]

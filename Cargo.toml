@@ -43,7 +43,7 @@ chardetng = "1.0"
 glob = "0.3"
 indexmap = "2.2"
 serde_yaml = "0.9"
-sha-crypt = "0.6"
+sha-crypt = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
 smart-default = "0.7"
 rustls-pki-types = "1.2"

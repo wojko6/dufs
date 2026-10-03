@@ -117,12 +117,38 @@ pub fn build_cli() -> Command {
                 .help("Allow upload files/folders"),
         )
         .arg(
+            Arg::new("allow-move")
+                .env("DUFS_ALLOW_MOVE")
+                .hide_env(true)
+                .long("allow-move")
+                .action(ArgAction::SetTrue)
+                .help("Allow move/rename files and folders"),
+        )
+        .arg(
             Arg::new("allow-delete")
                 .env("DUFS_ALLOW_DELETE")
 				.hide_env(true)
                 .long("allow-delete")
                 .action(ArgAction::SetTrue)
                 .help("Allow delete files/folders"),
+        )
+        .arg(
+            Arg::new("routercloud-allow-delete")
+                .env("DUFS_ROUTERCLOUD_ALLOW_DELETE")
+                .hide(true)
+                .hide_env(true)
+                .long("routercloud-allow-delete")
+                .action(ArgAction::SetTrue)
+                .help("Allow RouterCloud DELETE without enabling overwrite semantics"),
+        )
+        .arg(
+            Arg::new("routercloud-allow-edit")
+                .env("DUFS_ROUTERCLOUD_ALLOW_EDIT")
+                .hide(true)
+                .hide_env(true)
+                .long("routercloud-allow-edit")
+                .action(ArgAction::SetTrue)
+                .help("Allow isolated RouterCloud text editing"),
         )
         .arg(
             Arg::new("allow-search")
@@ -285,7 +311,23 @@ pub struct Args {
     pub auth: AccessControl,
     pub allow_all: bool,
     pub allow_upload: bool,
+    pub allow_move: bool,
     pub allow_delete: bool,
+    pub routercloud_allow_delete: bool,
+    pub routercloud_allow_edit: bool,
+
+    // ROUTERCLOUD_PASSWORD_RECOVERY_V1
+    //
+    // Configuration-only:
+    // routercloud-password-recovery-user
+    // routercloud-password-recovery-email
+    // routercloud-password-recovery-mail-config
+    // routercloud-password-recovery-reset-url
+    pub routercloud_password_recovery_user: Option<String>,
+    pub routercloud_password_recovery_email: Option<String>,
+    pub routercloud_password_recovery_mail_config: Option<PathBuf>,
+    pub routercloud_password_recovery_reset_url: Option<String>,
+
     pub allow_search: bool,
     pub allow_symlink: bool,
     pub allow_archive: bool,
@@ -344,7 +386,7 @@ impl Args {
         args.uri_prefix = if args.path_prefix.is_empty() {
             "/".to_owned()
         } else {
-            format!("/{}/", &encode_uri(&args.path_prefix))
+            format!("/{}/", encode_uri(&args.path_prefix))
         };
 
         if let Some(hidden) = matches.get_many::<String>("hidden") {
@@ -376,8 +418,17 @@ impl Args {
         if !args.allow_upload {
             args.allow_upload = allow_all || matches.get_flag("allow-upload");
         }
+        if !args.allow_move {
+            args.allow_move = allow_all || matches.get_flag("allow-move");
+        }
         if !args.allow_delete {
             args.allow_delete = allow_all || matches.get_flag("allow-delete");
+        }
+        if !args.routercloud_allow_delete {
+            args.routercloud_allow_delete = matches.get_flag("routercloud-allow-delete");
+        }
+        if !args.routercloud_allow_edit {
+            args.routercloud_allow_edit = matches.get_flag("routercloud-allow-edit");
         }
         if !args.allow_search {
             args.allow_search = allow_all || matches.get_flag("allow-search");

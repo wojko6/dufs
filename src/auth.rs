@@ -9,16 +9,23 @@ use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use md5::Context;
 use sha2::{Digest, Sha256};
-use sha_crypt::PasswordVerifier;
+use sha_crypt::{PasswordHasher, PasswordVerifier};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 use uuid::Uuid;
 
 const REALM: &str = "DUFS";
 const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60 * 24 * 7; // 7 days
 const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
+
+// RouterCloud browser session.
+// Kept separate from DUFS path-scoped download tokens.
+const ROUTERCLOUD_SESSION_EXPIRATION: u64 = 1000 * 60 * 60 * 12; // 12 hours
+const ROUTERCLOUD_SESSION_VERSION: u8 = 1;
+const ROUTERCLOUD_SESSION_CONTEXT: &str = "routercloud-session-v1";
 
 lazy_static! {
     static ref NONCESTARTHASH: Context = {
@@ -29,12 +36,25 @@ lazy_static! {
     };
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AccessControl {
     empty: bool,
     use_hashed_password: bool,
     users: IndexMap<String, (String, AccessPaths)>,
+
+    // ROUTERCLOUD_PASSWORD_OVERRIDE_V1
+    password_overrides: Arc<RwLock<HashMap<String, String>>>,
+
     anonymous: Option<AccessPaths>,
+}
+
+impl PartialEq for AccessControl {
+    fn eq(&self, other: &Self) -> bool {
+        self.empty == other.empty
+            && self.use_hashed_password == other.use_hashed_password
+            && self.users == other.users
+            && self.anonymous == other.anonymous
+    }
 }
 
 impl Default for AccessControl {
@@ -43,6 +63,7 @@ impl Default for AccessControl {
             empty: true,
             use_hashed_password: false,
             users: IndexMap::new(),
+            password_overrides: Arc::new(RwLock::new(HashMap::new())),
             anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
         }
     }
@@ -105,12 +126,198 @@ impl AccessControl {
             empty: false,
             use_hashed_password,
             users,
+            password_overrides: Arc::new(RwLock::new(HashMap::new())),
             anonymous,
         })
     }
 
     pub fn has_users(&self) -> bool {
         !self.users.is_empty()
+    }
+
+    // ROUTERCLOUD_PASSWORD_RECOVERY_V1
+    pub fn has_user(&self, user: &str) -> bool {
+        self.users.contains_key(user)
+    }
+
+    // ROUTERCLOUD_PASSWORD_OVERRIDE_V1
+    pub fn set_password_override(&self, user: &str, password_hash: String) -> Result<()> {
+        if !self.users.contains_key(user) {
+            bail!("Not found user '{user}'");
+        }
+
+        if !password_hash.starts_with("$6$") {
+            bail!("Password override must use SHA-512-crypt");
+        }
+
+        let mut overrides = self
+            .password_overrides
+            .write()
+            .map_err(|_| anyhow!("Password override lock poisoned"))?;
+
+        overrides.insert(user.to_string(), password_hash);
+
+        Ok(())
+    }
+
+    pub fn has_password_override(&self, user: &str) -> bool {
+        self.password_overrides
+            .read()
+            .map(|values| values.contains_key(user))
+            .unwrap_or(false)
+    }
+
+    pub fn uses_hashed_password(&self) -> bool {
+        if self.use_hashed_password {
+            return true;
+        }
+
+        self.password_overrides
+            .read()
+            .map(|values| !values.is_empty())
+            .unwrap_or(true)
+    }
+
+    fn effective_password(&self, user: &str, configured: &str) -> String {
+        self.password_overrides
+            .read()
+            .ok()
+            .and_then(|values| values.get(user).cloned())
+            .unwrap_or_else(|| configured.to_string())
+    }
+
+    /// Authenticate a username/password pair without exposing the stored
+    /// password or password hash to the caller.
+    pub fn authenticate_password(&self, user: &str, password: &str) -> Option<AccessPaths> {
+        let (stored_password, access_paths) = self.users.get(user)?;
+
+        let effective_password = self.effective_password(user, stored_password);
+
+        if verify_password(password, &effective_password) {
+            Some(access_paths.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Authenticate the real HTTP request method while authorizing
+    /// the resulting operation as read-only.
+    ///
+    /// RouterCloud selected ZIP uses POST only to carry the selected paths,
+    /// but it must retain GET-level filesystem permissions.
+    pub fn guard_read_action(
+        &self,
+        path: &str,
+        request_method: &Method,
+        authorization: Option<&HeaderValue>,
+    ) -> (Option<String>, Option<AccessPaths>) {
+        if self.empty {
+            return (None, Some(AccessPaths::new(AccessPerm::ReadWrite)));
+        }
+
+        if let Some(authorization) = authorization {
+            if let Some(user) = get_auth_user(authorization) {
+                if let Some((pass, ap)) = self.users.get(&user) {
+                    let effective_password = self.effective_password(&user, pass);
+
+                    if check_auth(
+                        authorization,
+                        request_method.as_str(),
+                        &user,
+                        &effective_password,
+                    )
+                    .is_some()
+                    {
+                        return (Some(user), ap.guard(path, &Method::GET));
+                    }
+                }
+            }
+
+            return (None, None);
+        }
+
+        if let Some(ap) = self.anonymous.as_ref() {
+            return (None, ap.guard(path, &Method::GET));
+        }
+
+        (None, None)
+    }
+
+    /// Generate a RouterCloud browser-session token.
+    ///
+    /// The token contains no password. It is signed with a key derived from
+    /// the configured account credential, so changing the credential
+    /// automatically invalidates all previously issued sessions.
+    pub fn generate_session_token(&self, user: &str) -> Result<String> {
+        let exp = unix_now().as_millis() as u64 + ROUTERCLOUD_SESSION_EXPIRATION;
+        self.generate_session_token_until(user, exp)
+    }
+
+    fn generate_session_token_until(&self, user: &str, exp: u64) -> Result<String> {
+        let (stored_password, _) = self
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+
+        let effective_password = self.effective_password(user, stored_password);
+
+        let message = format!("{ROUTERCLOUD_SESSION_CONTEXT}:{user}:{exp}");
+
+        let mut signing_key = derive_secret_key(user, &effective_password);
+        let signature = signing_key.sign(message.as_bytes()).to_bytes();
+
+        let mut raw = Vec::with_capacity(1 + 64 + 8 + user.len());
+        raw.push(ROUTERCLOUD_SESSION_VERSION);
+        raw.extend_from_slice(&signature);
+        raw.extend_from_slice(&exp.to_be_bytes());
+        raw.extend_from_slice(user.as_bytes());
+
+        Ok(hex::encode(raw))
+    }
+
+    /// Verify a RouterCloud browser-session token.
+    pub fn verify_session_token<'a>(&'a self, token: &str) -> Result<(String, &'a AccessPaths)> {
+        let raw = hex::decode(token)?;
+
+        // version + signature + expiry + at least one username byte
+        if raw.len() < 74 {
+            bail!("Invalid RouterCloud session token");
+        }
+
+        if raw[0] != ROUTERCLOUD_SESSION_VERSION {
+            bail!("Unsupported RouterCloud session token version");
+        }
+
+        let signature_bytes = &raw[1..65];
+        let exp_bytes = &raw[65..73];
+        let user_bytes = &raw[73..];
+
+        let exp = u64::from_be_bytes(exp_bytes.try_into()?);
+
+        if unix_now().as_millis() as u64 > exp {
+            bail!("RouterCloud session expired");
+        }
+
+        let user = std::str::from_utf8(user_bytes)?;
+
+        if user.is_empty() {
+            bail!("Invalid RouterCloud session user");
+        }
+
+        let (stored_password, access_paths) = self
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+
+        let signature = Signature::from_bytes(&<[u8; 64]>::try_from(signature_bytes)?);
+
+        let effective_password = self.effective_password(user, stored_password);
+
+        let message = format!("{ROUTERCLOUD_SESSION_CONTEXT}:{user}:{exp}");
+
+        derive_secret_key(user, &effective_password).verify(message.as_bytes(), &signature)?;
+
+        Ok((user.to_string(), access_paths))
     }
 
     pub fn guard(
@@ -139,7 +346,12 @@ impl AccessControl {
                     if method == Method::OPTIONS {
                         return (Some(user), Some(AccessPaths::new(AccessPerm::ReadOnly)));
                     }
-                    if check_auth(authorization, method.as_str(), &user, pass).is_some() {
+
+                    let effective_password = self.effective_password(&user, pass);
+
+                    if check_auth(authorization, method.as_str(), &user, &effective_password)
+                        .is_some()
+                    {
                         return (Some(user), ap.guard(path, method));
                     }
                 }
@@ -164,9 +376,13 @@ impl AccessControl {
             .users
             .get(user)
             .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+        let effective_password = self.effective_password(user, pass);
+
         let exp = unix_now().as_millis() as u64 + TOKEN_EXPIRATION;
+
         let message = format!("{path}:{exp}");
-        let mut signing_key = derive_secret_key(user, pass);
+
+        let mut signing_key = derive_secret_key(user, &effective_password);
         let sig = signing_key.sign(message.as_bytes()).to_bytes();
 
         let mut raw = Vec::with_capacity(64 + 8 + user.len());
@@ -201,8 +417,11 @@ impl AccessControl {
 
         let sig = Signature::from_bytes(&<[u8; 64]>::try_from(sig_bytes)?);
 
+        let effective_password = self.effective_password(user, pass);
+
         let message = format!("{path}:{exp}");
-        derive_secret_key(user, pass).verify(message.as_bytes(), &sig)?;
+
+        derive_secret_key(user, &effective_password).verify(message.as_bytes(), &sig)?;
         Ok((user.to_string(), ap))
     }
 }
@@ -384,7 +603,7 @@ impl AccessPerm {
 }
 
 pub fn www_authenticate(res: &mut Response, args: &Args) -> Result<()> {
-    if args.auth.use_hashed_password {
+    if args.auth.uses_hashed_password() {
         let basic = HeaderValue::from_str(&format!("Basic realm=\"{REALM}\""))?;
         res.headers_mut().insert(WWW_AUTHENTICATE, basic);
     } else {
@@ -413,6 +632,25 @@ pub fn get_auth_user(authorization: &HeaderValue) -> Option<String> {
     }
 }
 
+fn verify_password(password: &str, stored_password: &str) -> bool {
+    if stored_password.starts_with("$6$") {
+        sha_crypt::ShaCrypt::SHA512
+            .verify_password(password.as_bytes(), stored_password)
+            .is_ok()
+    } else {
+        password == stored_password
+    }
+}
+
+// ROUTERCLOUD_PASSWORD_HASH_V1
+pub fn hash_password_sha512(password: &str) -> Result<String> {
+    let hash = sha_crypt::ShaCrypt::SHA512
+        .hash_password(password.as_bytes())
+        .map_err(|err| anyhow!("Failed to hash RouterCloud password: {err}"))?;
+
+    Ok(hash.to_string())
+}
+
 pub fn check_auth(
     authorization: &HeaderValue,
     method: &str,
@@ -427,18 +665,11 @@ pub fn check_auth(
             return None;
         }
 
-        if auth_pass.starts_with("$6$") {
-            if sha_crypt::ShaCrypt::SHA512
-                .verify_password(pass.as_bytes(), auth_pass)
-                .is_ok()
-            {
-                return Some(());
-            }
-        } else if pass == auth_pass {
-            return Some(());
+        if verify_password(pass, auth_pass) {
+            Some(())
+        } else {
+            None
         }
-
-        None
     } else if let Some(value) = strip_prefix(authorization.as_bytes(), b"Digest ") {
         let digest_map = to_headermap(value).ok()?;
         if let (Some(username), Some(nonce), Some(user_response)) = (
@@ -749,5 +980,99 @@ mod tests {
             paths.find("dir2/dir23//dir231/file"),
             Some(AccessPaths::new(AccessPerm::ReadWrite))
         );
+    }
+
+    #[test]
+    fn test_routercloud_read_action_uses_request_method_for_auth() {
+        let auth = AccessControl::new(&["alice:secret@/:ro"]).unwrap();
+
+        let encoded = STANDARD.encode("alice:secret");
+
+        let authorization = HeaderValue::from_str(&format!("Basic {encoded}")).unwrap();
+
+        // Ordinary POST is a write operation and must be denied
+        // for a read-only account.
+        let (_, normal_post) = auth.guard("/", &Method::POST, Some(&authorization), None, false);
+
+        assert!(normal_post.is_none());
+
+        // Selected archive authenticates the actual POST request,
+        // but authorizes access to the path as a read operation.
+        let (user, read_action) = auth.guard_read_action("/", &Method::POST, Some(&authorization));
+
+        assert_eq!(user.as_deref(), Some("alice"));
+
+        assert_eq!(
+            read_action.map(|paths| paths.perm()),
+            Some(AccessPerm::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn test_routercloud_password_override_auth() {
+        let auth = AccessControl::new(&["alice:old-secret@/:rw"]).unwrap();
+
+        assert!(auth.authenticate_password("alice", "old-secret",).is_some());
+
+        let old_session = auth.generate_session_token("alice").unwrap();
+
+        let new_hash = hash_password_sha512("new-secret-1234").unwrap();
+
+        assert!(new_hash.starts_with("$6$"));
+
+        auth.set_password_override("alice", new_hash).unwrap();
+
+        assert!(auth.has_password_override("alice"));
+
+        assert!(auth.authenticate_password("alice", "old-secret",).is_none());
+
+        assert!(auth
+            .authenticate_password("alice", "new-secret-1234",)
+            .is_some());
+
+        /*
+         * Zmiana credentialu musi
+         * unieważnić poprzednią sesję.
+         */
+        assert!(auth.verify_session_token(&old_session).is_err());
+
+        let new_session = auth.generate_session_token("alice").unwrap();
+
+        assert!(auth.verify_session_token(&new_session).is_ok());
+    }
+
+    #[test]
+    fn test_routercloud_session_auth() {
+        let auth = AccessControl::new(&["alice:secret@/:rw"]).unwrap();
+
+        assert!(auth.authenticate_password("alice", "secret").is_some());
+
+        assert!(auth
+            .authenticate_password("alice", "wrong-password")
+            .is_none());
+
+        assert!(auth.authenticate_password("unknown", "secret").is_none());
+
+        let token = auth.generate_session_token("alice").unwrap();
+
+        let (user, access_paths) = auth.verify_session_token(&token).unwrap();
+
+        assert_eq!(user, "alice");
+        assert!(access_paths.perm().readwrite());
+
+        // Any modification of the signed token must invalidate it.
+        let mut tampered = token.into_bytes();
+        let last = tampered.len() - 1;
+
+        tampered[last] = if tampered[last] == b'0' { b'1' } else { b'0' };
+
+        let tampered = String::from_utf8(tampered).unwrap();
+
+        assert!(auth.verify_session_token(&tampered).is_err());
+
+        // Explicitly expired token.
+        let expired = auth.generate_session_token_until("alice", 0).unwrap();
+
+        assert!(auth.verify_session_token(&expired).is_err());
     }
 }

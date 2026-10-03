@@ -14,7 +14,7 @@ keywords = ["static", "file", "server", "webdav", "cli"]
 clap = { version = "4.5", features = ["wrap_help", "env"] }
 clap_complete = "4.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "signal", "net"]}
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "signal", "net", "sync", "process"]}
 tokio-util = { version = "0.7",  features = ["io-util", "compat"] }
 hyper = { version = "1", features = ["http1", "server"] }
 percent-encoding = "2.3"
@@ -43,7 +43,7 @@ chardetng = "1.0"
 glob = "0.3"
 indexmap = "2.2"
 serde_yaml = "0.9"
-sha-crypt = "0.6"
+sha-crypt = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
 smart-default = "0.7"
 rustls-pki-types = "1.2"
@@ -54,6 +54,7 @@ pin-project-lite = "0.2"
 sha2 = "0.11.0"
 ed25519-dalek = "2.2.0"
 hex = "0.4.3"
+libc = "0.2"
 
 [features]
 default = ["tls"]

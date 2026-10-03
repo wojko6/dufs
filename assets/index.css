@@ -139,6 +139,13 @@ svg {
   padding: 0 1em;
 }
 
+.storage-info {
+  margin: 0.5em 0 0.7em 0;
+  font-size: 0.9em;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
 .empty-folder {
   font-style: italic;
 }

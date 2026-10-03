@@ -15,9 +15,9 @@ fn assets(server: TestServer) -> Result<(), Error> {
     let favicon_ico = format!("/__dufs_v{ver}__/favicon.ico");
     let text = resp.text()?;
     println!("{text}");
-    assert!(text.contains(&format!(r#"href="{index_css}""#)));
-    assert!(text.contains(&format!(r#"href="{favicon_ico}""#)));
-    assert!(text.contains(&format!(r#"src="{index_js}""#)));
+    assert!(text.contains(&format!(r#"href="{index_css}?v="#)));
+    assert!(text.contains(&format!(r#"href="{favicon_ico}?v="#)));
+    assert!(text.contains(&format!(r#"src="{index_js}?v="#)));
     Ok(())
 }
 
@@ -74,9 +74,9 @@ fn assets_with_prefix(#[with(&["--path-prefix", "xyz"])] server: TestServer) -> 
     let index_css = format!("/xyz/__dufs_v{ver}__/index.css");
     let favicon_ico = format!("/xyz/__dufs_v{ver}__/favicon.ico");
     let text = resp.text()?;
-    assert!(text.contains(&format!(r#"href="{index_css}""#)));
-    assert!(text.contains(&format!(r#"href="{favicon_ico}""#)));
-    assert!(text.contains(&format!(r#"src="{index_js}""#)));
+    assert!(text.contains(&format!(r#"href="{index_css}?v="#)));
+    assert!(text.contains(&format!(r#"href="{favicon_ico}?v="#)));
+    assert!(text.contains(&format!(r#"src="{index_js}?v="#)));
     Ok(())
 }
 

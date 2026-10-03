@@ -278,14 +278,14 @@ fn get_storage_info(path: &Path) -> Option<StorageInfo> {
     let stat = unsafe { stat.assume_init() };
 
     let block_size = if stat.f_frsize > 0 {
-        stat.f_frsize as u64
+        stat.f_frsize
     } else {
-        stat.f_bsize as u64
+        stat.f_bsize
     };
 
-    let total = (stat.f_blocks as u64).saturating_mul(block_size);
-    let free = (stat.f_bfree as u64).saturating_mul(block_size);
-    let available = (stat.f_bavail as u64).saturating_mul(block_size);
+    let total = stat.f_blocks.saturating_mul(block_size);
+    let free = stat.f_bfree.saturating_mul(block_size);
+    let available = stat.f_bavail.saturating_mul(block_size);
 
     Some(StorageInfo {
         total,
@@ -328,7 +328,7 @@ async fn rename_noreplace(path: &Path, dest: &Path) -> std::io::Result<()> {
         }
     })
     .await
-    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?
+    .map_err(std::io::Error::other)?
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -405,7 +405,7 @@ impl Server {
                 args.uri_prefix[0..args.uri_prefix.len() - 1].to_string(),
                 encode_uri(&format!(
                     "{}{}",
-                    &args.uri_prefix,
+                    args.uri_prefix,
                     get_file_name(&args.serve_path)
                 )),
             ]
@@ -919,9 +919,7 @@ impl Server {
                 }
             }
             Method::DELETE => {
-                if path == self.args.serve_path.as_path() {
-                    status_forbid(&mut res);
-                } else if !allow_remove {
+                if path == self.args.serve_path.as_path() || !allow_remove {
                     status_forbid(&mut res);
                 } else if !is_miss {
                     self.handle_delete(path, is_dir, &mut res).await?
@@ -3528,7 +3526,7 @@ impl PathItem {
             LocalResult::Single(v) => format!("{}", v.format("%a, %d %b %Y %H:%M:%S GMT")),
             _ => String::new(),
         };
-        let mut href = encode_uri(&format!("{}{}", prefix, &self.name));
+        let mut href = encode_uri(&format!("{}{}", prefix, self.name));
         if self.is_dir() && !href.ends_with('/') {
             href.push('/');
         }

@@ -173,6 +173,21 @@ const ROUTERCLOUD_ZIP_SELECTION_BODY_MAX: usize = 65536;
 
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
+// ROUTERCLOUD_EMAIL_LOGIN_V1
+fn resolve_routercloud_login_user(
+    identifier: &str,
+    configured_user: Option<&str>,
+    configured_email: Option<&str>,
+) -> String {
+    if let (Some(user), Some(email)) = (configured_user, configured_email) {
+        if email.trim().eq_ignore_ascii_case(identifier.trim()) {
+            return user.to_string();
+        }
+    }
+
+    identifier.to_string()
+}
+
 fn normalize_routercloud_favorite_path(value: &str) -> Option<String> {
     if value.is_empty() || value.len() > 4096 || value.contains('\0') {
         return None;
@@ -359,6 +374,44 @@ pub struct Server {
 
 impl Server {
     pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
+        /*
+         * ROUTERCLOUD_EMAIL_LOGIN_V1
+         *
+         * The email address is only a login alias for one
+         * existing DUFS account. Permissions and password
+         * state remain attached to the canonical username.
+         */
+        match (
+            args.routercloud_login_user.as_deref(),
+            args.routercloud_login_email.as_deref(),
+        ) {
+            (None, None) => {}
+
+            (Some(user), Some(email)) => {
+                let email = email.trim();
+
+                if user.trim().is_empty()
+                    || email.is_empty()
+                    || email.len() > 320
+                    || email.contains('\r')
+                    || email.contains('\n')
+                    || !email.contains('@')
+                {
+                    return Err(anyhow!("Invalid RouterCloud email login configuration"));
+                }
+
+                if !args.auth.has_user(user) {
+                    return Err(anyhow!("RouterCloud email login user does not exist"));
+                }
+            }
+
+            _ => {
+                return Err(anyhow!(
+                    "RouterCloud email login requires both user and email"
+                ));
+            }
+        }
+
         /*
          * ROUTERCLOUD_PASSWORD_OVERRIDE_STORE_V1
          *
@@ -2288,20 +2341,30 @@ impl Server {
             return Ok(());
         }
 
+        // ROUTERCLOUD_EMAIL_LOGIN_V1
+        // Resolve a configured email alias to the canonical DUFS username.
+        // The canonical account still owns the password, permissions and
+        // RouterCloud session token.
+        let auth_user = resolve_routercloud_login_user(
+            username,
+            self.args.routercloud_login_user.as_deref(),
+            self.args.routercloud_login_email.as_deref(),
+        );
+
         if self
             .args
             .auth
-            .authenticate_password(username, password)
+            .authenticate_password(&auth_user, password)
             .is_none()
         {
             // Deliberately do not send WWW-Authenticate here.
             // A browser must not open its native Basic Auth dialog.
             *res.status_mut() = StatusCode::UNAUTHORIZED;
-            *res.body_mut() = body_full("Invalid username or password");
+            *res.body_mut() = body_full("Invalid login or password");
             return Ok(());
         }
 
-        let token = self.args.auth.generate_session_token(username)?;
+        let token = self.args.auth.generate_session_token(&auth_user)?;
 
         let cookie = routercloud_session_cookie(&token);
 
@@ -4230,6 +4293,50 @@ where
 #[cfg(test)]
 mod routercloud_session_http_tests {
     use super::*;
+
+    #[test]
+    fn test_routercloud_email_login_alias_resolution() {
+        assert_eq!(
+            resolve_routercloud_login_user(
+                "alice",
+                Some("alice"),
+                Some("alice@example.com"),
+            ),
+            "alice"
+        );
+
+        assert_eq!(
+            resolve_routercloud_login_user(
+                "alice@example.com",
+                Some("alice"),
+                Some("alice@example.com"),
+            ),
+            "alice"
+        );
+
+        assert_eq!(
+            resolve_routercloud_login_user(
+                "  ALICE@EXAMPLE.COM  ",
+                Some("alice"),
+                Some("alice@example.com"),
+            ),
+            "alice"
+        );
+
+        assert_eq!(
+            resolve_routercloud_login_user(
+                "other@example.com",
+                Some("alice"),
+                Some("alice@example.com"),
+            ),
+            "other@example.com"
+        );
+
+        assert_eq!(
+            resolve_routercloud_login_user("alice@example.com", None, None),
+            "alice@example.com"
+        );
+    }
 
     #[test]
     fn test_routercloud_password_reset_token_hashing() {

@@ -264,6 +264,11 @@ pub struct StorageInfo {
 }
 
 #[cfg(unix)]
+fn statvfs_to_u64<T: Into<u64>>(value: T) -> u64 {
+    value.into()
+}
+
+#[cfg(unix)]
 fn get_storage_info(path: &Path) -> Option<StorageInfo> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -278,14 +283,14 @@ fn get_storage_info(path: &Path) -> Option<StorageInfo> {
     let stat = unsafe { stat.assume_init() };
 
     let block_size = if stat.f_frsize > 0 {
-        stat.f_frsize
+        statvfs_to_u64(stat.f_frsize)
     } else {
-        stat.f_bsize
+        statvfs_to_u64(stat.f_bsize)
     };
 
-    let total = stat.f_blocks.saturating_mul(block_size);
-    let free = stat.f_bfree.saturating_mul(block_size);
-    let available = stat.f_bavail.saturating_mul(block_size);
+    let total = statvfs_to_u64(stat.f_blocks).saturating_mul(block_size);
+    let free = statvfs_to_u64(stat.f_bfree).saturating_mul(block_size);
+    let available = statvfs_to_u64(stat.f_bavail).saturating_mul(block_size);
 
     Some(StorageInfo {
         total,

@@ -642,6 +642,15 @@ fn verify_password(password: &str, stored_password: &str) -> bool {
     }
 }
 
+// ROUTERCLOUD_PASSWORD_HASH_V1
+pub fn hash_password_sha512(password: &str) -> Result<String> {
+    let hash = sha_crypt::ShaCrypt::SHA512
+        .hash_password(password.as_bytes())
+        .map_err(|err| anyhow!("Failed to hash RouterCloud password: {err}"))?;
+
+    Ok(hash.to_string())
+}
+
 pub fn check_auth(
     authorization: &HeaderValue,
     method: &str,
@@ -1007,10 +1016,7 @@ mod tests {
 
         let old_session = auth.generate_session_token("alice").unwrap();
 
-        let new_hash = sha_crypt::ShaCrypt::SHA512
-            .hash_password(b"new-secret-1234")
-            .unwrap()
-            .to_string();
+        let new_hash = hash_password_sha512("new-secret-1234").unwrap();
 
         assert!(new_hash.starts_with("$6$"));
 

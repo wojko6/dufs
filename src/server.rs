@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
+use crate::auth::{hash_password_sha512, www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{
@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
+use tokio::sync::Mutex;
 use tokio::{fs, io};
 
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
@@ -85,6 +86,9 @@ const ROUTERCLOUD_LOGIN_BODY_MAX: usize = 8192;
 
 // ROUTERCLOUD_PASSWORD_RECOVERY_V1
 const ROUTERCLOUD_PASSWORD_RESET_REQUEST_PATH: &str = "/__routercloud/password-reset/request";
+
+const ROUTERCLOUD_PASSWORD_RESET_CONFIRM_PATH: &str = "/__routercloud/password-reset/confirm";
+
 const ROUTERCLOUD_PASSWORD_RESET_BODY_MAX: usize = 8192;
 const ROUTERCLOUD_PASSWORD_RESET_VERSION: u8 = 1;
 const ROUTERCLOUD_PASSWORD_RESET_TTL_MS: u64 = 15 * 60 * 1000;
@@ -97,6 +101,73 @@ struct RouterCloudPasswordResetStore {
     token_sha256: String,
     issued_at_ms: u64,
     expires_at_ms: u64,
+}
+
+// ROUTERCLOUD_PASSWORD_OVERRIDE_STORE_V1
+const ROUTERCLOUD_PASSWORD_OVERRIDE_VERSION: u8 = 1;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RouterCloudPasswordOverrideStore {
+    version: u8,
+    user: String,
+    password_sha512_crypt: String,
+    updated_at_ms: u64,
+}
+
+fn routercloud_password_override_store_path_for(serve_path: &Path, user: &str) -> Result<PathBuf> {
+    let parent = serve_path
+        .parent()
+        .ok_or_else(|| anyhow!("RouterCloud serve path has no parent"))?;
+
+    let mut hasher = Sha256::new();
+
+    hasher.update(user.as_bytes());
+
+    let user_id = hex::encode(hasher.finalize());
+
+    Ok(parent
+        .join(".routercloud-system")
+        .join("password-overrides")
+        .join(format!("{user_id}.json")))
+}
+
+fn load_routercloud_password_override_sync(
+    serve_path: &Path,
+    user: &str,
+) -> Result<Option<RouterCloudPasswordOverrideStore>> {
+    let path = routercloud_password_override_store_path_for(serve_path, user)?;
+
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+
+        Err(err) => return Err(err.into()),
+    };
+
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(&path)?.permissions().mode();
+
+        if mode & 0o077 != 0 {
+            return Err(anyhow!(
+                "RouterCloud password override permissions are too broad"
+            ));
+        }
+    }
+
+    let store: RouterCloudPasswordOverrideStore = serde_json::from_slice(&data)?;
+
+    if store.version != ROUTERCLOUD_PASSWORD_OVERRIDE_VERSION
+        || store.user != user
+        || !store.password_sha512_crypt.starts_with("$6$")
+    {
+        return Err(anyhow!("Invalid RouterCloud password override store"));
+    }
+
+    Ok(Some(store))
 }
 
 const ROUTERCLOUD_EDIT_BODY_MAX: usize = EDITABLE_TEXT_MAX_SIZE as usize;
@@ -278,10 +349,56 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+
+    // Serializes reset-token creation and consumption.
+    routercloud_password_reset_lock: Mutex<()>,
 }
 
 impl Server {
     pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
+        /*
+         * ROUTERCLOUD_PASSWORD_OVERRIDE_STORE_V1
+         *
+         * Password reset credentials survive process
+         * restarts. Access permissions continue to come
+         * exclusively from the normal DUFS auth config.
+         */
+        match (
+            args.routercloud_password_recovery_user.clone(),
+            args.routercloud_password_recovery_email.clone(),
+        ) {
+            (None, None) => {}
+
+            (Some(user), Some(email)) => {
+                if user.trim().is_empty() || email.trim().is_empty() {
+                    return Err(anyhow!(
+                        "Invalid RouterCloud password recovery configuration"
+                    ));
+                }
+
+                if !args.auth.has_user(&user) {
+                    return Err(anyhow!("RouterCloud password recovery user does not exist"));
+                }
+
+                if let Some(store) =
+                    load_routercloud_password_override_sync(&args.serve_path, &user)?
+                {
+                    args.auth
+                        .set_password_override(&user, store.password_sha512_crypt)?;
+
+                    if !args.auth.has_password_override(&user) {
+                        return Err(anyhow!("Failed to activate RouterCloud password override"));
+                    }
+                }
+            }
+
+            _ => {
+                return Err(anyhow!(
+                    "RouterCloud password recovery requires both user and email"
+                ));
+            }
+        }
+
         let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
         let assets_revision = compute_assets_revision(args.assets.as_deref());
         let single_file_req_paths = if args.path_is_file {
@@ -308,6 +425,7 @@ impl Server {
             assets_prefix,
             assets_revision,
             html,
+            routercloud_password_reset_lock: Mutex::new(()),
         })
     }
 
@@ -383,6 +501,23 @@ impl Server {
             }
 
             self.handle_routercloud_password_reset_request(req, &mut res)
+                .await?;
+
+            return Ok(res);
+        }
+
+        // ROUTERCLOUD_PASSWORD_RESET_CONFIRM_V1
+        if req.uri().path() == ROUTERCLOUD_PASSWORD_RESET_CONFIRM_PATH {
+            if req.method() != Method::POST {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+
+                res.headers_mut()
+                    .insert("allow", HeaderValue::from_static("POST"));
+
+                return Ok(res);
+            }
+
+            self.handle_routercloud_password_reset_confirm(req, &mut res)
                 .await?;
 
             return Ok(res);
@@ -2284,6 +2419,8 @@ impl Server {
             return Ok(());
         }
 
+        let _reset_guard = self.routercloud_password_reset_lock.lock().await;
+
         let now_ms = routercloud_unix_time_ms();
 
         /*
@@ -2322,6 +2459,251 @@ impl Server {
 
         self.save_routercloud_password_reset(configured_user, &store)
             .await?;
+
+        Ok(())
+    }
+
+    // ROUTERCLOUD_PASSWORD_RESET_CONFIRM_V1
+    async fn handle_routercloud_password_reset_confirm(
+        &self,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        routercloud_auth_no_store(res);
+
+        let content_type = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        let media_type = content_type.split(';').next().unwrap_or_default().trim();
+
+        if !media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+
+            *res.body_mut() = body_full("Unsupported Media Type");
+
+            return Ok(());
+        }
+
+        if let Some(content_length) = req.headers().get(CONTENT_LENGTH) {
+            let content_length = match content_length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                Some(value) => value,
+
+                None => {
+                    status_bad_request(res, "Invalid Content-Length");
+
+                    return Ok(());
+                }
+            };
+
+            if content_length > ROUTERCLOUD_PASSWORD_RESET_BODY_MAX {
+                *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+
+                *res.body_mut() = body_full("Payload Too Large");
+
+                return Ok(());
+            }
+        }
+
+        let mut incoming = req.into_body();
+        let mut body = Vec::new();
+
+        while let Some(frame) = incoming.frame().await {
+            let frame = frame?;
+
+            if let Ok(data) = frame.into_data() {
+                if body.len().saturating_add(data.len()) > ROUTERCLOUD_PASSWORD_RESET_BODY_MAX {
+                    *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+
+                    *res.body_mut() = body_full("Payload Too Large");
+
+                    return Ok(());
+                }
+
+                body.extend_from_slice(&data);
+            }
+        }
+
+        let fields: HashMap<String, String> = form_urlencoded::parse(&body).into_owned().collect();
+
+        let token = fields
+            .get("token")
+            .map(|value| value.trim())
+            .unwrap_or_default();
+
+        let password = fields
+            .get("password")
+            .map(String::as_str)
+            .unwrap_or_default();
+
+        let password_confirm = fields
+            .get("password_confirm")
+            .map(String::as_str)
+            .unwrap_or_default();
+
+        if token.is_empty() || password.is_empty() || password_confirm.is_empty() {
+            status_bad_request(res, "Missing reset fields");
+
+            return Ok(());
+        }
+
+        if password != password_confirm {
+            status_bad_request(res, "Passwords do not match");
+
+            return Ok(());
+        }
+
+        if !valid_routercloud_new_password(password) {
+            *res.status_mut() = StatusCode::UNPROCESSABLE_ENTITY;
+
+            *res.body_mut() = body_full("Password must contain 12 to 128 characters");
+
+            return Ok(());
+        }
+
+        let Some(configured_user) = self.args.routercloud_password_recovery_user.as_deref() else {
+            status_bad_request(res, "Invalid or expired reset token");
+
+            return Ok(());
+        };
+
+        if !self.args.auth.has_user(configured_user) {
+            status_bad_request(res, "Invalid or expired reset token");
+
+            return Ok(());
+        }
+
+        /*
+         * Token generation and consumption are
+         * serialized inside one DUFS process.
+         */
+        let _reset_guard = self.routercloud_password_reset_lock.lock().await;
+
+        let store = match self
+            .load_routercloud_password_reset(configured_user)
+            .await?
+        {
+            Some(store) => store,
+
+            None => {
+                status_bad_request(res, "Invalid or expired reset token");
+
+                return Ok(());
+            }
+        };
+
+        let now_ms = routercloud_unix_time_ms();
+
+        if store.expires_at_ms <= now_ms
+            || !routercloud_password_reset_token_matches(token, &store.token_sha256)
+        {
+            status_bad_request(res, "Invalid or expired reset token");
+
+            return Ok(());
+        }
+
+        /*
+         * Hash only after a valid token was proven.
+         * This prevents unauthenticated callers from
+         * forcing expensive password hashing.
+         */
+        let password_hash = hash_password_sha512(password)?;
+
+        /*
+         * Consume the token BEFORE changing the
+         * credential. If a later write fails, the
+         * token remains consumed and a fresh reset
+         * must be requested.
+         */
+        let reset_path = self.routercloud_password_reset_store_path(configured_user)?;
+
+        fs::remove_file(&reset_path).await?;
+
+        self.save_routercloud_password_override(configured_user, &password_hash)
+            .await?;
+
+        self.args
+            .auth
+            .set_password_override(configured_user, password_hash)?;
+
+        if !self.args.auth.has_password_override(configured_user) {
+            return Err(anyhow!("Failed to activate RouterCloud password override"));
+        }
+
+        /*
+         * Current browser cookie is removed explicitly.
+         * Every other existing RouterCloud session is
+         * rejected automatically because the signing
+         * credential changed.
+         */
+        res.headers_mut().insert(
+            "set-cookie",
+            HeaderValue::from_static(
+                "__Host-routercloud_session=; Path=/; Max-Age=0; \
+HttpOnly; Secure; SameSite=Strict; \
+Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            ),
+        );
+
+        *res.status_mut() = StatusCode::NO_CONTENT;
+
+        Ok(())
+    }
+
+    fn routercloud_password_override_store_path(&self, user: &str) -> Result<PathBuf> {
+        routercloud_password_override_store_path_for(&self.args.serve_path, user)
+    }
+
+    async fn save_routercloud_password_override(
+        &self,
+        user: &str,
+        password_sha512_crypt: &str,
+    ) -> Result<()> {
+        if !password_sha512_crypt.starts_with("$6$") {
+            return Err(anyhow!("Invalid RouterCloud password hash"));
+        }
+
+        let path = self.routercloud_password_override_store_path(user)?;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("RouterCloud password override path has no parent"))?;
+
+        fs::create_dir_all(parent).await?;
+
+        #[cfg(unix)]
+        fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+
+        let store = RouterCloudPasswordOverrideStore {
+            version: ROUTERCLOUD_PASSWORD_OVERRIDE_VERSION,
+
+            user: user.to_string(),
+
+            password_sha512_crypt: password_sha512_crypt.to_string(),
+
+            updated_at_ms: routercloud_unix_time_ms(),
+        };
+
+        let temp = parent.join(format!(".password-override-{}.tmp", Uuid::new_v4(),));
+
+        let data = serde_json::to_vec_pretty(&store)?;
+
+        fs::write(&temp, data).await?;
+
+        #[cfg(unix)]
+        fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)).await?;
+
+        if let Err(err) = fs::rename(&temp, &path).await {
+            let _ = fs::remove_file(&temp).await;
+
+            return Err(err.into());
+        }
 
         Ok(())
     }
@@ -3378,6 +3760,35 @@ HttpOnly; Secure; SameSite=Strict"
     )
 }
 
+// ROUTERCLOUD_PASSWORD_RESET_CONFIRM_V1
+fn valid_routercloud_new_password(password: &str) -> bool {
+    let length = password.chars().count();
+
+    (12..=128).contains(&length) && !password.contains('\0')
+}
+
+fn routercloud_password_reset_token_matches(raw_token: &str, expected_sha256: &str) -> bool {
+    if raw_token.len() != 64 || !raw_token.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    let actual = Sha256::digest(raw_token.as_bytes());
+
+    let expected = match hex::decode(expected_sha256) {
+        Ok(value) if value.len() == actual.len() => value,
+
+        _ => return false,
+    };
+
+    let mut diff = 0u8;
+
+    for (left, right) in actual.iter().zip(expected.iter()) {
+        diff |= left ^ right;
+    }
+
+    diff == 0
+}
+
 // ROUTERCLOUD_PASSWORD_RECOVERY_V1
 fn routercloud_unix_time_ms() -> u64 {
     SystemTime::now()
@@ -3662,6 +4073,15 @@ mod routercloud_session_http_tests {
 
         assert_eq!(hash_a, expected);
 
+        assert!(routercloud_password_reset_token_matches(&token_a, &hash_a,));
+
+        assert!(!routercloud_password_reset_token_matches(&token_b, &hash_a,));
+
+        assert!(!routercloud_password_reset_token_matches(
+            "invalid-token",
+            &hash_a,
+        ));
+
         /*
          * Persistent state receives only the hash,
          * never the raw reset token.
@@ -3689,6 +4109,57 @@ mod routercloud_session_http_tests {
         assert_eq!(ROUTERCLOUD_PASSWORD_RESET_TTL_MS, 15 * 60 * 1000);
 
         assert_eq!(ROUTERCLOUD_PASSWORD_RESET_COOLDOWN_MS, 60 * 1000);
+
+        assert!(valid_routercloud_new_password("abcdefghijkl"));
+
+        assert!(!valid_routercloud_new_password("abcdefghijk"));
+
+        assert!(!valid_routercloud_new_password(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn test_routercloud_password_override_store_roundtrip() {
+        let root =
+            std::env::temp_dir().join(format!("dufs-routercloud-password-{}", Uuid::new_v4(),));
+
+        let serve_path = root.join("cloud");
+
+        std::fs::create_dir_all(&serve_path).unwrap();
+
+        let hash = hash_password_sha512("new-secret-1234").unwrap();
+
+        let path = routercloud_password_override_store_path_for(&serve_path, "alice").unwrap();
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let store = RouterCloudPasswordOverrideStore {
+            version: ROUTERCLOUD_PASSWORD_OVERRIDE_VERSION,
+
+            user: "alice".to_string(),
+
+            password_sha512_crypt: hash.clone(),
+
+            updated_at_ms: 1234,
+        };
+
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let loaded = load_routercloud_password_override_sync(&serve_path, "alice")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.user, "alice");
+
+        assert_eq!(loaded.password_sha512_crypt, hash);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

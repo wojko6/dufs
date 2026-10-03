@@ -3949,19 +3949,19 @@ fn routercloud_password_reset_mail_message(
 
     Ok(format!(
         concat!(
-            "From: RouterCloud <{email}>\\r\\n",
-            "To: <{email}>\\r\\n",
-            "Subject: RouterCloud - zmiana hasla\\r\\n",
-            "MIME-Version: 1.0\\r\\n",
-            "Content-Type: text/plain; charset=UTF-8\\r\\n",
-            "Content-Transfer-Encoding: 8bit\\r\\n",
-            "\\r\\n",
-            "Otrzymalismy prosbe o zmiane hasla do RouterCloud.\\r\\n",
-            "\\r\\n",
-            "Link jest wazny przez 15 minut:\\r\\n",
-            "{link}\\r\\n",
-            "\\r\\n",
-            "Jesli to nie Ty wyslales prosbe, zignoruj te wiadomosc.\\r\\n"
+            "From: RouterCloud <{email}>\r\n",
+            "To: <{email}>\r\n",
+            "Subject: RouterCloud - zmiana hasła\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: text/plain; charset=UTF-8\r\n",
+            "Content-Transfer-Encoding: 8bit\r\n",
+            "\r\n",
+            "Otrzymaliśmy prośbę o zmianę hasła do RouterCloud.\r\n",
+            "\r\n",
+            "Link jest ważny przez 15 minut:\r\n",
+            "{link}\r\n",
+            "\r\n",
+            "Jeśli to nie Ty wysłałeś tę prośbę, zignoruj tę wiadomość.\r\n"
         ),
         email = email,
         link = link,
@@ -4314,6 +4314,19 @@ mod routercloud_session_http_tests {
         )));
 
         assert!(!message.contains("?reset_token="));
+
+        /*
+         * SMTP/MIME must contain real CRLF separators.
+         * Literal backslash-r/backslash-n sequences
+         * would make the message malformed.
+         */
+        assert!(message.starts_with("From: RouterCloud <alice@example.com>\r\n"));
+
+        assert!(message.contains("Subject: RouterCloud - zmiana hasła\r\n"));
+
+        assert!(message.contains("\r\n\r\nOtrzymaliśmy prośbę"));
+
+        assert!(!message.contains("\\r\\n"));
     }
 
     #[test]

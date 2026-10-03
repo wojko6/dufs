@@ -30,7 +30,7 @@ use hyper::{
     },
     Method, StatusCode, Uri,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -38,6 +38,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
@@ -69,6 +72,13 @@ const ROUTERCLOUD_LOGIN_PATH: &str = "/__routercloud/login";
 const ROUTERCLOUD_LOGIN_CSS_PATH: &str = "/__routercloud/login.css";
 const ROUTERCLOUD_LOGIN_JS_PATH: &str = "/__routercloud/login.js";
 const ROUTERCLOUD_LOGOUT_PATH: &str = "/__routercloud/logout";
+
+// ROUTERCLOUD_FAVORITES_API_V1
+const ROUTERCLOUD_FAVORITES_PATH: &str = "/__routercloud/favorites";
+const ROUTERCLOUD_FAVORITES_BODY_MAX: usize = 8192;
+const ROUTERCLOUD_FAVORITES_MAX: usize = 256;
+const ROUTERCLOUD_FAVORITES_VERSION: u8 = 1;
+
 const ROUTERCLOUD_SESSION_COOKIE: &str = "__Host-routercloud_session";
 const ROUTERCLOUD_SESSION_MAX_AGE: u64 = 60 * 60 * 12;
 const ROUTERCLOUD_LOGIN_BODY_MAX: usize = 8192;
@@ -77,6 +87,40 @@ const ROUTERCLOUD_ZIP_SELECTION_BODY_MAX: usize = 65536;
 
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
+fn normalize_routercloud_favorite_path(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+        return None;
+    }
+
+    let path = Path::new(value);
+
+    if path.is_absolute() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let value = value.to_string_lossy();
+
+                if value.is_empty() {
+                    return None;
+                }
+
+                parts.push(value.to_string());
+            }
+            _ => return None,
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(parts.join("/"))
+}
 
 fn valid_routercloud_zip_selection_path(value: &str) -> bool {
     if value.is_empty() || value.len() > 4096 || value.contains('\0') {
@@ -100,7 +144,6 @@ fn valid_routercloud_zip_selection_path(value: &str) -> bool {
 
     count > 0
 }
-
 
 fn compute_assets_revision(assets_path: Option<&Path>) -> String {
     let mut hasher = Sha256::new();
@@ -126,7 +169,6 @@ fn compute_assets_revision(assets_path: Option<&Path>) -> String {
         .map(|byte| format!("{:02x}", *byte))
         .collect()
 }
-
 
 #[derive(Debug, Serialize)]
 pub struct StorageInfo {
@@ -207,9 +249,7 @@ async fn rename_noreplace(path: &Path, dest: &Path) -> std::io::Result<()> {
 async fn rename_noreplace(path: &Path, dest: &Path) -> std::io::Result<()> {
     match fs::symlink_metadata(dest).await {
         Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs::rename(path, dest).await
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::rename(path, dest).await,
         Err(err) => Err(err),
     }
 }
@@ -298,12 +338,8 @@ impl Server {
 
         if req.uri().path() == ROUTERCLOUD_LOGIN_PATH {
             if req.method() == Method::GET {
-                self.handle_routercloud_login_asset(
-                    "login.html",
-                    req.headers(),
-                    &mut res,
-                )
-                .await?;
+                self.handle_routercloud_login_asset("login.html", req.headers(), &mut res)
+                    .await?;
                 return Ok(res);
             }
 
@@ -326,12 +362,8 @@ impl Server {
                 return Ok(res);
             }
 
-            self.handle_routercloud_login_asset(
-                "login.css",
-                req.headers(),
-                &mut res,
-            )
-            .await?;
+            self.handle_routercloud_login_asset("login.css", req.headers(), &mut res)
+                .await?;
             return Ok(res);
         }
 
@@ -343,12 +375,8 @@ impl Server {
                 return Ok(res);
             }
 
-            self.handle_routercloud_login_asset(
-                "login.js",
-                req.headers(),
-                &mut res,
-            )
-            .await?;
+            self.handle_routercloud_login_asset("login.js", req.headers(), &mut res)
+                .await?;
             return Ok(res);
         }
 
@@ -361,6 +389,12 @@ impl Server {
             }
 
             self.handle_routercloud_logout(&mut res)?;
+            return Ok(res);
+        }
+
+        if req.uri().path() == ROUTERCLOUD_FAVORITES_PATH {
+            self.handle_routercloud_favorites(req, &mut res).await?;
+
             return Ok(res);
         }
 
@@ -406,104 +440,56 @@ impl Server {
             .collect();
 
         let is_routercloud_zip_selection =
-            method == Method::POST
-                && has_query_flag(
-                    &query_params,
-                    "zip-selected",
-                );
+            method == Method::POST && has_query_flag(&query_params, "zip-selected");
 
-        let explicit_token =
-            method == Method::GET
-                && query_params.contains_key("token");
+        let explicit_token = method == Method::GET && query_params.contains_key("token");
 
-        let guard =
-            if is_routercloud_zip_selection {
-                if authorization.is_some() {
-                    self.args
-                        .auth
-                        .guard_read_action(
-                            &relative_path,
-                            &method,
-                            authorization,
-                        )
-                } else if let Some(session_token) =
-                    get_cookie_value(
-                        headers,
-                        ROUTERCLOUD_SESSION_COOKIE,
-                    )
-                {
-                    match self
+        let guard = if is_routercloud_zip_selection {
+            if authorization.is_some() {
+                self.args
+                    .auth
+                    .guard_read_action(&relative_path, &method, authorization)
+            } else if let Some(session_token) =
+                get_cookie_value(headers, ROUTERCLOUD_SESSION_COOKIE)
+            {
+                match self.args.auth.verify_session_token(session_token) {
+                    Ok((user, access_paths)) => {
+                        (Some(user), access_paths.guard(&relative_path, &Method::GET))
+                    }
+                    Err(_) => self
                         .args
                         .auth
-                        .verify_session_token(session_token)
-                    {
-                        Ok((user, access_paths)) => (
-                            Some(user),
-                            access_paths.guard(
-                                &relative_path,
-                                &Method::GET,
-                            ),
-                        ),
-                        Err(_) => self.args
-                            .auth
-                            .guard_read_action(
-                                &relative_path,
-                                &method,
-                                None,
-                            ),
-                    }
-                } else {
-                    self.args
-                        .auth
-                        .guard_read_action(
-                            &relative_path,
-                            &method,
-                            None,
-                        )
-                }
-            } else if authorization.is_some() || explicit_token {
-                self.args.auth.guard(
-                    &relative_path,
-                    &method,
-                    authorization,
-                    query_params.get("token"),
-                    is_microsoft_webdav,
-                )
-            } else if let Some(session_token) =
-                get_cookie_value(
-                    headers,
-                    ROUTERCLOUD_SESSION_COOKIE,
-                )
-            {
-                match self
-                    .args
-                    .auth
-                    .verify_session_token(session_token)
-                {
-                    Ok((user, access_paths)) => (
-                        Some(user),
-                        access_paths.guard(
-                            &relative_path,
-                            &method,
-                        ),
-                    ),
-                    Err(_) => self.args.auth.guard(
-                        &relative_path,
-                        &method,
-                        None,
-                        None,
-                        is_microsoft_webdav,
-                    ),
+                        .guard_read_action(&relative_path, &method, None),
                 }
             } else {
-                self.args.auth.guard(
-                    &relative_path,
-                    &method,
-                    None,
-                    None,
-                    is_microsoft_webdav,
-                )
-            };
+                self.args
+                    .auth
+                    .guard_read_action(&relative_path, &method, None)
+            }
+        } else if authorization.is_some() || explicit_token {
+            self.args.auth.guard(
+                &relative_path,
+                &method,
+                authorization,
+                query_params.get("token"),
+                is_microsoft_webdav,
+            )
+        } else if let Some(session_token) = get_cookie_value(headers, ROUTERCLOUD_SESSION_COOKIE) {
+            match self.args.auth.verify_session_token(session_token) {
+                Ok((user, access_paths)) => {
+                    (Some(user), access_paths.guard(&relative_path, &method))
+                }
+                Err(_) => {
+                    self.args
+                        .auth
+                        .guard(&relative_path, &method, None, None, is_microsoft_webdav)
+                }
+            }
+        } else {
+            self.args
+                .auth
+                .guard(&relative_path, &method, None, None, is_microsoft_webdav)
+        };
 
         let (user, access_paths) = match guard {
             (None, None) => {
@@ -589,10 +575,8 @@ impl Server {
         let allow_upload = self.args.allow_upload;
         let allow_move = self.args.allow_move;
         let allow_delete = self.args.allow_delete;
-        let allow_remove =
-            allow_delete || self.args.routercloud_allow_delete;
-        let allow_routercloud_edit =
-            self.args.routercloud_allow_edit;
+        let allow_remove = allow_delete || self.args.routercloud_allow_delete;
+        let allow_routercloud_edit = self.args.routercloud_allow_edit;
         let allow_search = self.args.allow_search;
         let allow_archive = self.args.allow_archive;
         let render_index = self.args.render_index;
@@ -611,13 +595,8 @@ impl Server {
                 return Ok(res);
             }
 
-            self.handle_routercloud_zip_selection(
-                path,
-                req,
-                access_paths,
-                &mut res,
-            )
-            .await?;
+            self.handle_routercloud_zip_selection(path, req, access_paths, &mut res)
+                .await?;
 
             return Ok(res);
         }
@@ -792,8 +771,7 @@ impl Server {
                         *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
                         *res.body_mut() = body_full("Payload Too Large");
                     } else {
-                        self.handle_routercloud_save(path, req, &mut res)
-                            .await?;
+                        self.handle_routercloud_save(path, req, &mut res).await?;
                     }
                 }
                 "PROPFIND" => {
@@ -983,9 +961,7 @@ impl Server {
             let frame = frame?;
 
             if let Ok(data) = frame.into_data() {
-                if body.len().saturating_add(data.len())
-                    > ROUTERCLOUD_EDIT_BODY_MAX
-                {
+                if body.len().saturating_add(data.len()) > ROUTERCLOUD_EDIT_BODY_MAX {
                     *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
                     *res.body_mut() = body_full("Payload Too Large");
                     return Ok(());
@@ -1005,9 +981,7 @@ impl Server {
             .parent()
             .ok_or_else(|| anyhow!("Missing parent directory"))?;
 
-        let temp_path = parent.join(
-            format!(".routercloud-save-{}.tmp", Uuid::new_v4())
-        );
+        let temp_path = parent.join(format!(".routercloud-save-{}.tmp", Uuid::new_v4()));
 
         let permissions = meta.permissions();
 
@@ -1015,9 +989,7 @@ impl Server {
             return Err(err.into());
         }
 
-        if let Err(err) =
-            fs::set_permissions(&temp_path, permissions).await
-        {
+        if let Err(err) = fs::set_permissions(&temp_path, permissions).await {
             let _ = fs::remove_file(&temp_path).await;
             return Err(err.into());
         }
@@ -1044,27 +1016,17 @@ impl Server {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
 
-        let media_type = content_type
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim();
+        let media_type = content_type.split(';').next().unwrap_or_default().trim();
 
-        if !media_type.eq_ignore_ascii_case(
-            "application/x-www-form-urlencoded",
-        ) {
-            *res.status_mut() =
-                StatusCode::UNSUPPORTED_MEDIA_TYPE;
+        if !media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
 
-            *res.body_mut() =
-                body_full("Unsupported Media Type");
+            *res.body_mut() = body_full("Unsupported Media Type");
 
             return Ok(());
         }
 
-        if let Some(content_length) =
-            req.headers().get(CONTENT_LENGTH)
-        {
+        if let Some(content_length) = req.headers().get(CONTENT_LENGTH) {
             let content_length = match content_length
                 .to_str()
                 .ok()
@@ -1072,23 +1034,16 @@ impl Server {
             {
                 Some(value) => value,
                 None => {
-                    status_bad_request(
-                        res,
-                        "Invalid Content-Length",
-                    );
+                    status_bad_request(res, "Invalid Content-Length");
 
                     return Ok(());
                 }
             };
 
-            if content_length
-                > ROUTERCLOUD_ZIP_SELECTION_BODY_MAX
-            {
-                *res.status_mut() =
-                    StatusCode::PAYLOAD_TOO_LARGE;
+            if content_length > ROUTERCLOUD_ZIP_SELECTION_BODY_MAX {
+                *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
 
-                *res.body_mut() =
-                    body_full("Payload Too Large");
+                *res.body_mut() = body_full("Payload Too Large");
 
                 return Ok(());
             }
@@ -1101,16 +1056,10 @@ impl Server {
             let frame = frame?;
 
             if let Ok(data) = frame.into_data() {
-                if body
-                    .len()
-                    .saturating_add(data.len())
-                    > ROUTERCLOUD_ZIP_SELECTION_BODY_MAX
-                {
-                    *res.status_mut() =
-                        StatusCode::PAYLOAD_TOO_LARGE;
+                if body.len().saturating_add(data.len()) > ROUTERCLOUD_ZIP_SELECTION_BODY_MAX {
+                    *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
 
-                    *res.body_mut() =
-                        body_full("Payload Too Large");
+                    *res.body_mut() = body_full("Payload Too Large");
 
                     return Ok(());
                 }
@@ -1119,58 +1068,42 @@ impl Server {
             }
         }
 
-        let selection_json =
-            form_urlencoded::parse(&body)
-                .find_map(|(key, value)| {
-                    if key == "selection" {
-                        Some(value.into_owned())
-                    } else {
-                        None
-                    }
-                });
+        let selection_json = form_urlencoded::parse(&body).find_map(|(key, value)| {
+            if key == "selection" {
+                Some(value.into_owned())
+            } else {
+                None
+            }
+        });
 
         let selection_json = match selection_json {
             Some(value) => value,
             None => {
-                status_bad_request(
-                    res,
-                    "Missing selection",
-                );
+                status_bad_request(res, "Missing selection");
 
                 return Ok(());
             }
         };
 
-        let selection: Vec<String> =
-            match serde_json::from_str(&selection_json) {
-                Ok(value) => value,
-                Err(_) => {
-                    status_bad_request(
-                        res,
-                        "Invalid selection",
-                    );
+        let selection: Vec<String> = match serde_json::from_str(&selection_json) {
+            Ok(value) => value,
+            Err(_) => {
+                status_bad_request(res, "Invalid selection");
 
-                    return Ok(());
-                }
-            };
+                return Ok(());
+            }
+        };
 
         if selection.is_empty() {
-            status_bad_request(
-                res,
-                "Empty selection",
-            );
+            status_bad_request(res, "Empty selection");
 
             return Ok(());
         }
 
-        if selection.len()
-            > MAX_SUBPATHS_COUNT as usize
-        {
-            *res.status_mut() =
-                StatusCode::PAYLOAD_TOO_LARGE;
+        if selection.len() > MAX_SUBPATHS_COUNT as usize {
+            *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
 
-            *res.body_mut() =
-                body_full("Too many selected paths");
+            *res.body_mut() = body_full("Too many selected paths");
 
             return Ok(());
         }
@@ -1179,13 +1112,8 @@ impl Server {
         let mut selected = Vec::new();
 
         for name in selection {
-            if !valid_routercloud_zip_selection_path(
-                &name,
-            ) {
-                status_bad_request(
-                    res,
-                    "Invalid selected path",
-                );
+            if !valid_routercloud_zip_selection_path(&name) {
+                status_bad_request(res, "Invalid selected path");
 
                 return Ok(());
             }
@@ -1194,112 +1122,71 @@ impl Server {
                 continue;
             }
 
-            let selected_access =
-                match access_paths.guard(
-                    &name,
-                    &Method::GET,
-                ) {
-                    Some(value) => value,
-                    None => {
-                        status_forbid(res);
-                        return Ok(());
-                    }
-                };
+            let selected_access = match access_paths.guard(&name, &Method::GET) {
+                Some(value) => value,
+                None => {
+                    status_forbid(res);
+                    return Ok(());
+                }
+            };
 
-            let selected_path =
-                dir.join(Path::new(&name));
+            let selected_path = dir.join(Path::new(&name));
 
-            if self
-                .guard_root_contained(&selected_path)
-                .await
-            {
+            if self.guard_root_contained(&selected_path).await {
                 status_forbid(res);
                 return Ok(());
             }
 
-            let meta =
-                match fs::metadata(&selected_path).await {
-                    Ok(value) => value,
-                    Err(err)
-                        if err.kind()
-                            == std::io::ErrorKind::NotFound =>
-                    {
-                        status_not_found(res);
-                        return Ok(());
-                    }
-                    Err(err) => return Err(err.into()),
-                };
+            let meta = match fs::metadata(&selected_path).await {
+                Ok(value) => value,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    status_not_found(res);
+                    return Ok(());
+                }
+                Err(err) => return Err(err.into()),
+            };
 
             let is_dir = meta.is_dir();
             let is_file = meta.is_file();
 
             if !is_dir && !is_file {
-                status_bad_request(
-                    res,
-                    "Unsupported selected path",
-                );
+                status_bad_request(res, "Unsupported selected path");
 
                 return Ok(());
             }
 
-            if is_hidden(
-                &self.args.hidden,
-                get_file_name(&selected_path),
-                is_dir,
-            ) {
+            if is_hidden(&self.args.hidden, get_file_name(&selected_path), is_dir) {
                 status_not_found(res);
                 return Ok(());
             }
 
-            selected.push((
-                selected_path,
-                selected_access,
-                is_dir,
-            ));
+            selected.push((selected_path, selected_access, is_dir));
         }
 
         if selected.is_empty() {
-            status_bad_request(
-                res,
-                "Empty selection",
-            );
+            status_bad_request(res, "Empty selection");
 
             return Ok(());
         }
 
-        let (mut writer, reader) =
-            tokio::io::duplex(BUF_SIZE);
+        let (mut writer, reader) = tokio::io::duplex(BUF_SIZE);
 
-        let dirname =
-            try_get_file_name(dir)?;
+        let dirname = try_get_file_name(dir)?;
 
-        set_content_disposition(
-            res,
-            false,
-            &format!(
-                "{dirname}-zaznaczone.zip"
-            ),
-        )?;
+        set_content_disposition(res, false, &format!("{dirname}-zaznaczone.zip"))?;
 
-        res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static(
-                "application/zip",
-            ),
-        );
+        res.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
 
         let base_dir = dir.to_owned();
         let hidden = self.args.hidden.clone();
         let running = self.running.clone();
 
-        let compression =
-            self.args.compress.to_compression();
+        let compression = self.args.compress.to_compression();
 
-        let follow_symlinks =
-            self.args.allow_symlink;
+        let follow_symlinks = self.args.allow_symlink;
 
-        let serve_path =
-            self.args.serve_path.clone();
+        let serve_path = self.args.serve_path.clone();
 
         tokio::spawn(async move {
             if let Err(err) = zip_selected(
@@ -1314,31 +1201,22 @@ impl Server {
             )
             .await
             {
-                error!(
-                    "Failed to zip RouterCloud selection: {err}"
-                );
+                error!("Failed to zip RouterCloud selection: {err}");
             }
         });
 
-        let reader_stream =
-            ReaderStream::with_capacity(
-                reader,
-                BUF_SIZE,
-            );
+        let reader_stream = ReaderStream::with_capacity(reader, BUF_SIZE);
 
-        let stream_body =
-            StreamBody::new(
-                reader_stream
-                    .map_ok(Frame::data)
-                    .map_err(|err| anyhow!("{err}")),
-            );
+        let stream_body = StreamBody::new(
+            reader_stream
+                .map_ok(Frame::data)
+                .map_err(|err| anyhow!("{err}")),
+        );
 
-        *res.body_mut() =
-            stream_body.boxed();
+        *res.body_mut() = stream_body.boxed();
 
         Ok(())
     }
-
 
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
         match is_dir {
@@ -2098,8 +1976,7 @@ impl Server {
             allow_upload: self.args.allow_upload && readwrite,
             allow_move: self.args.allow_move && readwrite,
             allow_delete: self.args.allow_delete && readwrite,
-            routercloud_allow_delete:
-                self.args.routercloud_allow_delete && readwrite,
+            routercloud_allow_delete: self.args.routercloud_allow_delete && readwrite,
             allow_search: self.args.allow_search,
             allow_archive: self.args.allow_archive,
             dir_exists: exist,
@@ -2162,24 +2039,14 @@ impl Server {
             return Ok(());
         }
 
-        self.handle_send_file(
-            &path,
-            headers,
-            false,
-            res,
-        )
-        .await?;
+        self.handle_send_file(&path, headers, false, res).await?;
 
         routercloud_auth_no_store(res);
 
         Ok(())
     }
 
-    async fn handle_routercloud_login(
-        &self,
-        req: Request,
-        res: &mut Response,
-    ) -> Result<()> {
+    async fn handle_routercloud_login(&self, req: Request, res: &mut Response) -> Result<()> {
         routercloud_auth_no_store(res);
 
         let content_type = req
@@ -2188,15 +2055,9 @@ impl Server {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
 
-        let media_type = content_type
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim();
+        let media_type = content_type.split(';').next().unwrap_or_default().trim();
 
-        if !media_type.eq_ignore_ascii_case(
-            "application/x-www-form-urlencoded",
-        ) {
+        if !media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
             *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
             *res.body_mut() = body_full("Unsupported Media Type");
             return Ok(());
@@ -2229,9 +2090,7 @@ impl Server {
             let frame = frame?;
 
             if let Ok(data) = frame.into_data() {
-                if body.len().saturating_add(data.len())
-                    > ROUTERCLOUD_LOGIN_BODY_MAX
-                {
+                if body.len().saturating_add(data.len()) > ROUTERCLOUD_LOGIN_BODY_MAX {
                     *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
                     *res.body_mut() = body_full("Payload Too Large");
                     return Ok(());
@@ -2241,10 +2100,7 @@ impl Server {
             }
         }
 
-        let fields: HashMap<String, String> =
-            form_urlencoded::parse(&body)
-                .into_owned()
-                .collect();
+        let fields: HashMap<String, String> = form_urlencoded::parse(&body).into_owned().collect();
 
         let username = fields
             .get("username")
@@ -2274,10 +2130,7 @@ impl Server {
             return Ok(());
         }
 
-        let token = self
-            .args
-            .auth
-            .generate_session_token(username)?;
+        let token = self.args.auth.generate_session_token(username)?;
 
         let cookie = routercloud_session_cookie(&token);
 
@@ -2289,10 +2142,341 @@ impl Server {
         Ok(())
     }
 
-    fn handle_routercloud_logout(
+    fn routercloud_favorites_store_path(&self, user: &str) -> Result<PathBuf> {
+        let parent = self
+            .args
+            .serve_path
+            .parent()
+            .ok_or_else(|| anyhow!("RouterCloud serve path has no parent"))?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(user.as_bytes());
+
+        let user_id = hex::encode(hasher.finalize());
+
+        Ok(parent
+            .join(".routercloud-system")
+            .join("favorites")
+            .join(format!("{user_id}.json")))
+    }
+
+    async fn load_routercloud_favorites(&self, user: &str) -> Result<RouterCloudFavoritesStore> {
+        let path = self.routercloud_favorites_store_path(user)?;
+
+        let data = match fs::read(&path).await {
+            Ok(data) => data,
+
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RouterCloudFavoritesStore {
+                    version: ROUTERCLOUD_FAVORITES_VERSION,
+                    favorites: Vec::new(),
+                });
+            }
+
+            Err(err) => return Err(err.into()),
+        };
+
+        let store: RouterCloudFavoritesStore = serde_json::from_slice(&data)?;
+
+        if store.version != ROUTERCLOUD_FAVORITES_VERSION {
+            return Err(anyhow!("Unsupported RouterCloud favorites version"));
+        }
+
+        if store.favorites.len() > ROUTERCLOUD_FAVORITES_MAX {
+            return Err(anyhow!("RouterCloud favorites limit exceeded"));
+        }
+
+        for favorite in &store.favorites {
+            if normalize_routercloud_favorite_path(favorite).as_deref() != Some(favorite.as_str()) {
+                return Err(anyhow!("Invalid path in RouterCloud favorites store"));
+            }
+        }
+
+        Ok(store)
+    }
+
+    async fn save_routercloud_favorites(
         &self,
-        res: &mut Response,
+        user: &str,
+        store: &RouterCloudFavoritesStore,
     ) -> Result<()> {
+        let path = self.routercloud_favorites_store_path(user)?;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("RouterCloud favorites path has no parent"))?;
+
+        fs::create_dir_all(parent).await?;
+
+        #[cfg(unix)]
+        fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+
+        let temp_path = parent.join(format!(".favorites-{}.tmp", Uuid::new_v4()));
+
+        let data = serde_json::to_vec(store)?;
+
+        if let Err(err) = fs::write(&temp_path, &data).await {
+            return Err(err.into());
+        }
+
+        #[cfg(unix)]
+        if let Err(err) =
+            fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600)).await
+        {
+            let _ = fs::remove_file(&temp_path).await;
+
+            return Err(err.into());
+        }
+
+        if let Err(err) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+
+            return Err(err.into());
+        }
+
+        Ok(())
+    }
+
+    async fn handle_routercloud_favorites(&self, req: Request, res: &mut Response) -> Result<()> {
+        routercloud_auth_no_store(res);
+
+        let method = req.method().clone();
+
+        if method != Method::GET && method != Method::POST && method != Method::DELETE {
+            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+
+            res.headers_mut()
+                .insert("allow", HeaderValue::from_static("GET, POST, DELETE"));
+
+            return Ok(());
+        }
+
+        let session_token = match get_cookie_value(req.headers(), ROUTERCLOUD_SESSION_COOKIE) {
+            Some(value) => value,
+
+            None => {
+                *res.status_mut() = StatusCode::UNAUTHORIZED;
+
+                *res.body_mut() = body_full("Unauthorized");
+
+                return Ok(());
+            }
+        };
+
+        let (user, access_paths) = match self.args.auth.verify_session_token(session_token) {
+            Ok((user, access_paths)) => (user, access_paths.clone()),
+
+            Err(_) => {
+                *res.status_mut() = StatusCode::UNAUTHORIZED;
+
+                *res.body_mut() = body_full("Unauthorized");
+
+                return Ok(());
+            }
+        };
+
+        if method == Method::GET {
+            let store = self.load_routercloud_favorites(&user).await?;
+
+            let mut favorites = Vec::new();
+
+            for favorite in store.favorites {
+                if access_paths.guard(&favorite, &Method::GET).is_none() {
+                    continue;
+                }
+
+                let Some(path) = self.join_path(&favorite) else {
+                    continue;
+                };
+
+                if self.guard_root_contained(&path).await {
+                    continue;
+                }
+
+                if !fs::try_exists(&path).await.unwrap_or_default() {
+                    continue;
+                }
+
+                let item = match self.to_pathitem(&path, &self.args.serve_path).await {
+                    Ok(Some(item)) => item,
+                    _ => continue,
+                };
+
+                let name = Path::new(&favorite)
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_else(|| favorite.clone());
+
+                favorites.push(RouterCloudFavoriteItem {
+                    path: favorite,
+                    name,
+                    path_type: item.path_type,
+                    mtime: item.mtime,
+                    size: item.size,
+                });
+            }
+
+            let output = serde_json::to_string(&RouterCloudFavoritesResponse { favorites })?;
+
+            res.headers_mut()
+                .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+
+            res.headers_mut()
+                .typed_insert(ContentLength(output.len() as u64));
+
+            *res.body_mut() = body_full(output);
+
+            return Ok(());
+        }
+
+        let content_type = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        let media_type = content_type.split(';').next().unwrap_or_default().trim();
+
+        if !media_type.eq_ignore_ascii_case("application/json") {
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+
+            *res.body_mut() = body_full("Expected application/json");
+
+            return Ok(());
+        }
+
+        if let Some(content_length) = req.headers().get(CONTENT_LENGTH) {
+            let content_length = match content_length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                Some(value) => value,
+
+                None => {
+                    status_bad_request(res, "Invalid Content-Length");
+
+                    return Ok(());
+                }
+            };
+
+            if content_length > ROUTERCLOUD_FAVORITES_BODY_MAX {
+                *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+
+                return Ok(());
+            }
+        }
+
+        let mut incoming = req.into_body();
+
+        let mut body = Vec::new();
+
+        while let Some(frame) = incoming.frame().await {
+            let frame = frame?;
+
+            if let Ok(data) = frame.into_data() {
+                if body.len().saturating_add(data.len()) > ROUTERCLOUD_FAVORITES_BODY_MAX {
+                    *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+
+                    return Ok(());
+                }
+
+                body.extend_from_slice(&data);
+            }
+        }
+
+        let request: RouterCloudFavoriteRequest = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+
+            Err(_) => {
+                status_bad_request(res, "Invalid JSON body");
+
+                return Ok(());
+            }
+        };
+
+        let favorite = match normalize_routercloud_favorite_path(&request.path) {
+            Some(value) => value,
+
+            None => {
+                status_bad_request(res, "Invalid favorite path");
+
+                return Ok(());
+            }
+        };
+
+        if access_paths.guard(&favorite, &Method::GET).is_none() {
+            status_forbid(res);
+            return Ok(());
+        }
+
+        let mut store = self.load_routercloud_favorites(&user).await?;
+
+        if method == Method::POST {
+            let Some(path) = self.join_path(&favorite) else {
+                status_bad_request(res, "Invalid favorite path");
+
+                return Ok(());
+            };
+
+            if self.guard_root_contained(&path).await {
+                status_forbid(res);
+                return Ok(());
+            }
+
+            if !fs::try_exists(&path).await.unwrap_or_default() {
+                status_not_found(res);
+                return Ok(());
+            }
+
+            match self.to_pathitem(&path, &self.args.serve_path).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    status_forbid(res);
+                    return Ok(());
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+
+            if store.favorites.iter().any(|value| value == &favorite) {
+                *res.status_mut() = StatusCode::NO_CONTENT;
+
+                return Ok(());
+            }
+
+            if store.favorites.len() >= ROUTERCLOUD_FAVORITES_MAX {
+                *res.status_mut() = StatusCode::CONFLICT;
+
+                *res.body_mut() = body_full("Favorites limit reached");
+
+                return Ok(());
+            }
+
+            store.favorites.push(favorite);
+
+            self.save_routercloud_favorites(&user, &store).await?;
+
+            *res.status_mut() = StatusCode::NO_CONTENT;
+
+            return Ok(());
+        }
+
+        let old_len = store.favorites.len();
+
+        store.favorites.retain(|value| value != &favorite);
+
+        if store.favorites.len() != old_len {
+            self.save_routercloud_favorites(&user, &store).await?;
+        }
+
+        *res.status_mut() = StatusCode::NO_CONTENT;
+
+        Ok(())
+    }
+
+    fn handle_routercloud_logout(&self, res: &mut Response) -> Result<()> {
         routercloud_auth_no_store(res);
 
         res.headers_mut().insert(
@@ -2359,18 +2543,15 @@ Expires=Thu, 01 Jan 1970 00:00:00 GMT",
             self.args
                 .auth
                 .guard(&dest_path, req.method(), authorization, None, false)
-        } else if let Some(session_token) =
-            get_cookie_value(headers, ROUTERCLOUD_SESSION_COOKIE)
-        {
+        } else if let Some(session_token) = get_cookie_value(headers, ROUTERCLOUD_SESSION_COOKIE) {
             match self.args.auth.verify_session_token(session_token) {
                 Ok((user, access_paths)) => {
                     (Some(user), access_paths.guard(&dest_path, req.method()))
                 }
-                Err(_) => {
-                    self.args
-                        .auth
-                        .guard(&dest_path, req.method(), None, None, false)
-                }
+                Err(_) => self
+                    .args
+                    .auth
+                    .guard(&dest_path, req.method(), None, None, false),
             }
         } else {
             self.args
@@ -2669,6 +2850,31 @@ impl PartialOrd for PathType {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct RouterCloudFavoriteRequest {
+    path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RouterCloudFavoritesStore {
+    version: u8,
+    favorites: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RouterCloudFavoriteItem {
+    path: String,
+    name: String,
+    path_type: PathType,
+    mtime: u64,
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RouterCloudFavoritesResponse {
+    favorites: Vec<RouterCloudFavoriteItem>,
+}
+
 #[derive(Debug, Serialize)]
 struct EditData {
     href: String,
@@ -2755,30 +2961,21 @@ async fn zip_selected<W: AsyncWrite + Unpin>(
 
     for (selected_path, selected_access, is_dir) in selected {
         let zip_paths = if is_dir {
-            let mut paths =
-                vec![selected_path.clone()];
+            let mut paths = vec![selected_path.clone()];
 
-            let mut descendants =
-                tokio::task::spawn(
-                    collect_dir_entries(
-                        selected_access,
-                        running.clone(),
-                        selected_path.clone(),
-                        hidden.clone(),
-                        follow_symlinks,
-                        serve_path.clone(),
-                        move |entry| {
-                            entry.path()
-                                .symlink_metadata()
-                                .is_ok()
-                                && (
-                                    entry.file_type().is_file()
-                                    || entry.file_type().is_dir()
-                                )
-                        },
-                    ),
-                )
-                .await?;
+            let mut descendants = tokio::task::spawn(collect_dir_entries(
+                selected_access,
+                running.clone(),
+                selected_path.clone(),
+                hidden.clone(),
+                follow_symlinks,
+                serve_path.clone(),
+                move |entry| {
+                    entry.path().symlink_metadata().is_ok()
+                        && (entry.file_type().is_file() || entry.file_type().is_dir())
+                },
+            ))
+            .await?;
 
             paths.append(&mut descendants);
 
@@ -2792,11 +2989,9 @@ async fn zip_selected<W: AsyncWrite + Unpin>(
                 continue;
             }
 
-            let meta =
-                fs::metadata(&zip_path).await?;
+            let meta = fs::metadata(&zip_path).await?;
 
-            let is_dir =
-                meta.is_dir();
+            let is_dir = meta.is_dir();
 
             let mut filename = match zip_path
                 .strip_prefix(base_dir)
@@ -2812,51 +3007,25 @@ async fn zip_selected<W: AsyncWrite + Unpin>(
                 filename.push('/');
             }
 
-            let (datetime, mode) =
-                get_file_mtime_and_mode(&zip_path).await?;
+            let (datetime, mode) = get_file_mtime_and_mode(&zip_path).await?;
 
-            let builder =
-                ZipEntryBuilder::new(
-                    filename.into(),
-                    compression,
-                )
+            let builder = ZipEntryBuilder::new(filename.into(), compression)
                 .unix_permissions(mode)
-                .last_modification_date(
-                    ZipDateTime::from_chrono(
-                        &datetime
-                    ),
-                );
+                .last_modification_date(ZipDateTime::from_chrono(&datetime));
 
             if is_dir {
-                writer
-                    .write_entry_whole(
-                        builder,
-                        &[],
-                    )
-                    .await?;
+                writer.write_entry_whole(builder, &[]).await?;
 
                 continue;
             }
 
-            let mut file =
-                File::open(&zip_path).await?;
+            let mut file = File::open(&zip_path).await?;
 
-            let mut file_writer =
-                writer
-                    .write_entry_stream(builder)
-                    .await?
-                    .compat_write();
+            let mut file_writer = writer.write_entry_stream(builder).await?.compat_write();
 
-            io::copy(
-                &mut file,
-                &mut file_writer,
-            )
-            .await?;
+            io::copy(&mut file, &mut file_writer).await?;
 
-            file_writer
-                .into_inner()
-                .close()
-                .await?;
+            file_writer.into_inner().close().await?;
         }
     }
 
@@ -2864,7 +3033,6 @@ async fn zip_selected<W: AsyncWrite + Unpin>(
 
     Ok(())
 }
-
 
 async fn zip_dir<W: AsyncWrite + Unpin>(
     writer: &mut W,
@@ -2920,10 +3088,7 @@ fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
     Some((etag, last_modified))
 }
 
-fn get_cookie_value<'a>(
-    headers: &'a HeaderMap<HeaderValue>,
-    name: &str,
-) -> Option<&'a str> {
+fn get_cookie_value<'a>(headers: &'a HeaderMap<HeaderValue>, name: &str) -> Option<&'a str> {
     for header in headers.get_all("cookie").iter() {
         let Ok(value) = header.to_str() else {
             continue;
@@ -2952,14 +3117,10 @@ HttpOnly; Secure; SameSite=Strict"
 }
 
 fn routercloud_auth_no_store(res: &mut Response) {
-    res.headers_mut().insert(
-        "cache-control",
-        HeaderValue::from_static("no-store"),
-    );
-    res.headers_mut().insert(
-        "pragma",
-        HeaderValue::from_static("no-cache"),
-    );
+    res.headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    res.headers_mut()
+        .insert("pragma", HeaderValue::from_static("no-cache"));
 }
 
 fn should_redirect_to_routercloud_login(
@@ -2992,10 +3153,8 @@ fn routercloud_login_redirect(res: &mut Response) {
 
     *res.status_mut() = StatusCode::FOUND;
 
-    res.headers_mut().insert(
-        "location",
-        HeaderValue::from_static(ROUTERCLOUD_LOGIN_PATH),
-    );
+    res.headers_mut()
+        .insert("location", HeaderValue::from_static(ROUTERCLOUD_LOGIN_PATH));
 }
 
 fn status_forbid(res: &mut Response) {
@@ -3191,62 +3350,69 @@ where
     paths
 }
 
-
 #[cfg(test)]
 mod routercloud_session_http_tests {
     use super::*;
 
     #[test]
     fn test_routercloud_zip_selection_path_validation() {
-        assert!(
-            valid_routercloud_zip_selection_path(
-                "plik.txt"
-            )
+        assert!(valid_routercloud_zip_selection_path("plik.txt"));
+
+        assert!(valid_routercloud_zip_selection_path("folder/plik.txt"));
+
+        assert!(valid_routercloud_zip_selection_path(
+            "Zażółć gęślą jaźń.txt"
+        ));
+
+        assert!(!valid_routercloud_zip_selection_path(""));
+
+        assert!(!valid_routercloud_zip_selection_path("/etc/passwd"));
+
+        assert!(!valid_routercloud_zip_selection_path("../secret"));
+
+        assert!(!valid_routercloud_zip_selection_path("folder/../secret"));
+
+        assert!(!valid_routercloud_zip_selection_path("."));
+
+        assert!(!valid_routercloud_zip_selection_path("./plik.txt"));
+    }
+
+    #[test]
+    fn test_routercloud_favorite_path_validation() {
+        assert_eq!(
+            normalize_routercloud_favorite_path("plik.txt"),
+            Some("plik.txt".to_string())
         );
 
-        assert!(
-            valid_routercloud_zip_selection_path(
-                "folder/plik.txt"
-            )
+        assert_eq!(
+            normalize_routercloud_favorite_path("folder/plik.txt"),
+            Some("folder/plik.txt".to_string())
         );
 
-        assert!(
-            valid_routercloud_zip_selection_path(
-                "Zażółć gęślą jaźń.txt"
-            )
+        assert_eq!(
+            normalize_routercloud_favorite_path("Zażółć gęślą/jaźń.txt"),
+            Some("Zażółć gęślą/jaźń.txt".to_string())
         );
 
-        assert!(
-            !valid_routercloud_zip_selection_path("")
+        assert_eq!(
+            normalize_routercloud_favorite_path("folder//plik.txt"),
+            Some("folder/plik.txt".to_string())
         );
 
-        assert!(
-            !valid_routercloud_zip_selection_path(
-                "/etc/passwd"
-            )
-        );
-
-        assert!(
-            !valid_routercloud_zip_selection_path(
-                "../secret"
-            )
-        );
-
-        assert!(
-            !valid_routercloud_zip_selection_path(
-                "folder/../secret"
-            )
-        );
-
-        assert!(
-            !valid_routercloud_zip_selection_path(".")
-        );
-
-        assert!(
-            !valid_routercloud_zip_selection_path(
-                "./plik.txt"
-            )
-        );
+        for invalid in [
+            "",
+            ".",
+            "./plik.txt",
+            "../secret",
+            "folder/../secret",
+            "/etc/passwd",
+        ] {
+            assert_eq!(
+                normalize_routercloud_favorite_path(invalid),
+                None,
+                "unexpectedly accepted: {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -3255,32 +3421,22 @@ mod routercloud_session_http_tests {
 
         headers.insert(
             "cookie",
-            HeaderValue::from_static(
-                "theme=dark; __Host-routercloud_session=abc123; language=pl",
-            ),
+            HeaderValue::from_static("theme=dark; __Host-routercloud_session=abc123; language=pl"),
         );
 
         assert_eq!(
-            get_cookie_value(
-                &headers,
-                ROUTERCLOUD_SESSION_COOKIE
-            ),
+            get_cookie_value(&headers, ROUTERCLOUD_SESSION_COOKIE),
             Some("abc123")
         );
 
-        assert_eq!(
-            get_cookie_value(&headers, "missing"),
-            None
-        );
+        assert_eq!(get_cookie_value(&headers, "missing"), None);
     }
 
     #[test]
     fn test_routercloud_session_cookie_security_flags() {
         let cookie = routercloud_session_cookie("token123");
 
-        assert!(cookie.starts_with(
-            "__Host-routercloud_session=token123;"
-        ));
+        assert!(cookie.starts_with("__Host-routercloud_session=token123;"));
 
         assert!(cookie.contains("Path=/"));
         assert!(cookie.contains("Max-Age=43200"));

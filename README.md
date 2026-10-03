@@ -424,6 +424,12 @@ Your assets folder must contains a `index.html` file.
 
 > A customized 404.html page is also supported.
 
+Here are some Third-party customize UI project:
+
+- https://github.com/TransparentLC/dufs-material-assets
+- https://github.com/cercky/dufs_web
+- https://github.com/52funny/dufs-tabler-web
+
 </details>
 
 ## License

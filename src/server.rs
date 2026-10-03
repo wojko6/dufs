@@ -3,14 +3,11 @@
 use crate::auth::{hash_password_sha512, www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
-use crate::utils::{
-    decode_uri, encode_uri, get_file_mtime_and_mode, get_file_name, glob, parse_range,
-    try_get_file_name,
-};
+use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name};
 use crate::Args;
 
 use anyhow::{anyhow, Result};
-use async_zip::{tokio::write::ZipFileWriter, Compression, ZipDateTime, ZipEntryBuilder};
+use async_deflate_zip::{Compression, WriterOptions, ZipWriter};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use chrono::{LocalResult, TimeZone, Utc};
@@ -52,7 +49,6 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::{fs, io};
 
-use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
@@ -911,6 +907,7 @@ impl Server {
                         Some(offset) => {
                             if offset < size && !allow_delete {
                                 status_forbid(&mut res);
+                                return Ok(res);
                             }
                             self.handle_upload(path, Some(offset), size, req, &mut res)
                                 .await?;
@@ -3281,15 +3278,14 @@ Expires=Thu, 01 Jan 1970 00:00:00 GMT",
         if self.args.allow_symlink {
             return false;
         }
-        let path = if !fs::try_exists(path).await.unwrap_or_default() {
-            match path.parent() {
-                Some(parent) => parent.to_path_buf(),
+        let mut check_path = path.to_path_buf();
+        while !fs::try_exists(&check_path).await.unwrap_or_default() {
+            match check_path.parent() {
+                Some(parent) => check_path = parent.to_path_buf(),
                 None => return true,
             }
-        } else {
-            path.to_path_buf()
-        };
-        !self.is_root_contained(path.as_path()).await
+        }
+        !self.is_root_contained(check_path.as_path()).await
     }
 
     async fn is_root_contained(&self, path: &Path) -> bool {
@@ -3383,8 +3379,11 @@ Expires=Thu, 01 Jan 1970 00:00:00 GMT",
         if path_prefix.is_empty() {
             return Some(new_path);
         }
+        if new_path == path_prefix {
+            return Some(String::new());
+        }
         new_path
-            .strip_prefix(path_prefix.trim_start_matches('/'))
+            .strip_prefix(&format!("{path_prefix}/"))
             .map(|v| v.trim_matches('/').to_string())
     }
 
@@ -3731,7 +3730,7 @@ async fn zip_selected<W: AsyncWrite + Unpin>(
     serve_path: PathBuf,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut writer = ZipFileWriter::with_tokio(writer);
+    let mut zip = ZipWriter::new(&mut *writer).with_level(compression);
     let hidden = Arc::new(hidden.to_vec());
     let mut seen_paths = HashSet::new();
 
@@ -3766,7 +3765,6 @@ async fn zip_selected<W: AsyncWrite + Unpin>(
             }
 
             let meta = fs::metadata(&zip_path).await?;
-
             let is_dir = meta.is_dir();
 
             let mut filename = match zip_path
@@ -3783,29 +3781,22 @@ async fn zip_selected<W: AsyncWrite + Unpin>(
                 filename.push('/');
             }
 
-            let (datetime, mode) = get_file_mtime_and_mode(&zip_path).await?;
-
-            let builder = ZipEntryBuilder::new(filename.into(), compression)
-                .unix_permissions(mode)
-                .last_modification_date(ZipDateTime::from_chrono(&datetime));
+            let options = WriterOptions::from_path(&zip_path).await?;
 
             if is_dir {
-                writer.write_entry_whole(builder, &[]).await?;
-
+                zip.append_directory(&filename, options).await?;
                 continue;
             }
 
             let mut file = File::open(&zip_path).await?;
+            let mut entry = zip.append_file(&filename, options).await?;
 
-            let mut file_writer = writer.write_entry_stream(builder).await?.compat_write();
-
-            io::copy(&mut file, &mut file_writer).await?;
-
-            file_writer.into_inner().close().await?;
+            io::copy(&mut file, &mut entry).await?;
+            entry.close().await?;
         }
     }
 
-    writer.close().await?;
+    zip.finalize().await?;
 
     Ok(())
 }
@@ -3820,8 +3811,8 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     serve_path: PathBuf,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut writer = ZipFileWriter::with_tokio(writer);
     let hidden = Arc::new(hidden.to_vec());
+
     let zip_paths = tokio::task::spawn(collect_dir_entries(
         access_paths,
         running,
@@ -3832,6 +3823,9 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
         move |x| x.path().symlink_metadata().is_ok() && x.file_type().is_file(),
     ))
     .await?;
+
+    let mut zip = ZipWriter::new(&mut *writer).with_level(compression);
+
     for zip_path in zip_paths.into_iter() {
         let filename = match zip_path
             .strip_prefix(dir)
@@ -3842,16 +3836,17 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
             Some(v) => v,
             None => continue,
         };
-        let (datetime, mode) = get_file_mtime_and_mode(&zip_path).await?;
-        let builder = ZipEntryBuilder::new(filename.into(), compression)
-            .unix_permissions(mode)
-            .last_modification_date(ZipDateTime::from_chrono(&datetime));
+
+        let options = WriterOptions::from_path(&zip_path).await?;
         let mut file = File::open(&zip_path).await?;
-        let mut file_writer = writer.write_entry_stream(builder).await?.compat_write();
-        io::copy(&mut file, &mut file_writer).await?;
-        file_writer.into_inner().close().await?;
+        let mut entry = zip.append_file(&filename, options).await?;
+
+        io::copy(&mut file, &mut entry).await?;
+        entry.close().await?;
     }
-    writer.close().await?;
+
+    zip.finalize().await?;
+
     Ok(())
 }
 

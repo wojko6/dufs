@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use async_zip::Compression;
+use async_deflate_zip::Compression;
 use clap::builder::{PossibleValue, PossibleValuesParser};
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command, ValueEnum};
 use clap_complete::{generate, Generator, Shell};
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::auth::AccessControl;
 use crate::http_logger::HttpLogger;
-use crate::utils::encode_uri;
+use crate::utils::{encode_uri, is_ipv6_available};
 
 pub fn build_cli() -> Command {
     let app = Command::new(env!("CARGO_CRATE_NAME"))
@@ -591,10 +591,10 @@ impl ValueEnum for Compress {
 impl Compress {
     pub fn to_compression(self) -> Compression {
         match self {
-            Compress::None => Compression::Stored,
-            Compress::Low => Compression::Deflate,
-            Compress::Medium => Compression::Bz,
-            Compress::High => Compression::Xz,
+            Compress::None => Compression::none(),
+            Compress::Low => Compression::fast(),
+            Compress::Medium => Compression::default(),
+            Compress::High => Compression::best(),
         }
     }
 }
@@ -684,7 +684,12 @@ fn default_serve_path() -> PathBuf {
 }
 
 fn default_addrs() -> Vec<BindAddr> {
-    BindAddr::parse_addrs(&["0.0.0.0", "::"]).unwrap()
+    let addrs = if is_ipv6_available() {
+        ["0.0.0.0", "::"].as_slice()
+    } else {
+        ["0.0.0.0"].as_slice()
+    };
+    BindAddr::parse_addrs(addrs).unwrap()
 }
 
 fn default_port() -> u16 {

@@ -315,6 +315,15 @@ pub struct Args {
     pub allow_delete: bool,
     pub routercloud_allow_delete: bool,
     pub routercloud_allow_edit: bool,
+
+    // ROUTERCLOUD_PASSWORD_RECOVERY_V1
+    //
+    // Configuration-only for now:
+    // routercloud-password-recovery-user
+    // routercloud-password-recovery-email
+    pub routercloud_password_recovery_user: Option<String>,
+    pub routercloud_password_recovery_email: Option<String>,
+
     pub allow_search: bool,
     pub allow_symlink: bool,
     pub allow_archive: bool,
@@ -412,12 +421,10 @@ impl Args {
             args.allow_delete = allow_all || matches.get_flag("allow-delete");
         }
         if !args.routercloud_allow_delete {
-            args.routercloud_allow_delete =
-                matches.get_flag("routercloud-allow-delete");
+            args.routercloud_allow_delete = matches.get_flag("routercloud-allow-delete");
         }
         if !args.routercloud_allow_edit {
-            args.routercloud_allow_edit =
-                matches.get_flag("routercloud-allow-edit");
+            args.routercloud_allow_edit = matches.get_flag("routercloud-allow-edit");
         }
         if !args.allow_search {
             args.allow_search = allow_all || matches.get_flag("allow-search");

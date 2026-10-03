@@ -44,7 +44,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use tokio::{fs, io};
@@ -82,6 +82,23 @@ const ROUTERCLOUD_FAVORITES_VERSION: u8 = 1;
 const ROUTERCLOUD_SESSION_COOKIE: &str = "__Host-routercloud_session";
 const ROUTERCLOUD_SESSION_MAX_AGE: u64 = 60 * 60 * 12;
 const ROUTERCLOUD_LOGIN_BODY_MAX: usize = 8192;
+
+// ROUTERCLOUD_PASSWORD_RECOVERY_V1
+const ROUTERCLOUD_PASSWORD_RESET_REQUEST_PATH: &str = "/__routercloud/password-reset/request";
+const ROUTERCLOUD_PASSWORD_RESET_BODY_MAX: usize = 8192;
+const ROUTERCLOUD_PASSWORD_RESET_VERSION: u8 = 1;
+const ROUTERCLOUD_PASSWORD_RESET_TTL_MS: u64 = 15 * 60 * 1000;
+const ROUTERCLOUD_PASSWORD_RESET_COOLDOWN_MS: u64 = 60 * 1000;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RouterCloudPasswordResetStore {
+    version: u8,
+    user: String,
+    token_sha256: String,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+}
+
 const ROUTERCLOUD_EDIT_BODY_MAX: usize = EDITABLE_TEXT_MAX_SIZE as usize;
 const ROUTERCLOUD_ZIP_SELECTION_BODY_MAX: usize = 65536;
 
@@ -351,6 +368,23 @@ impl Server {
             *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
             res.headers_mut()
                 .insert("allow", HeaderValue::from_static("GET, POST"));
+            return Ok(res);
+        }
+
+        // ROUTERCLOUD_PASSWORD_RECOVERY_V1
+        if req.uri().path() == ROUTERCLOUD_PASSWORD_RESET_REQUEST_PATH {
+            if req.method() != Method::POST {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+
+                res.headers_mut()
+                    .insert("allow", HeaderValue::from_static("POST"));
+
+                return Ok(res);
+            }
+
+            self.handle_routercloud_password_reset_request(req, &mut res)
+                .await?;
+
             return Ok(res);
         }
 
@@ -2142,6 +2176,234 @@ impl Server {
         Ok(())
     }
 
+    // ROUTERCLOUD_PASSWORD_RECOVERY_V1
+    async fn handle_routercloud_password_reset_request(
+        &self,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        routercloud_auth_no_store(res);
+
+        const NEUTRAL_STATUS: StatusCode = StatusCode::NO_CONTENT;
+
+        let content_type = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        let media_type = content_type.split(';').next().unwrap_or_default().trim();
+
+        if !media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+            *res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+            *res.body_mut() = body_full("Unsupported Media Type");
+
+            return Ok(());
+        }
+
+        if let Some(content_length) = req.headers().get(CONTENT_LENGTH) {
+            let content_length = match content_length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                Some(value) => value,
+
+                None => {
+                    status_bad_request(res, "Invalid Content-Length");
+
+                    return Ok(());
+                }
+            };
+
+            if content_length > ROUTERCLOUD_PASSWORD_RESET_BODY_MAX {
+                *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+
+                *res.body_mut() = body_full("Payload Too Large");
+
+                return Ok(());
+            }
+        }
+
+        let mut incoming = req.into_body();
+        let mut body = Vec::new();
+
+        while let Some(frame) = incoming.frame().await {
+            let frame = frame?;
+
+            if let Ok(data) = frame.into_data() {
+                if body.len().saturating_add(data.len()) > ROUTERCLOUD_PASSWORD_RESET_BODY_MAX {
+                    *res.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+
+                    *res.body_mut() = body_full("Payload Too Large");
+
+                    return Ok(());
+                }
+
+                body.extend_from_slice(&data);
+            }
+        }
+
+        let fields: HashMap<String, String> = form_urlencoded::parse(&body).into_owned().collect();
+
+        let email = fields
+            .get("email")
+            .map(|value| value.trim())
+            .unwrap_or_default();
+
+        if email.is_empty() || email.len() > 320 {
+            status_bad_request(res, "Invalid email");
+
+            return Ok(());
+        }
+
+        /*
+         * Od tego miejsca odpowiedź pozostaje neutralna.
+         * Nie ujawniamy, czy podany adres istnieje.
+         */
+        *res.status_mut() = NEUTRAL_STATUS;
+
+        let Some(configured_email) = self.args.routercloud_password_recovery_email.as_deref()
+        else {
+            return Ok(());
+        };
+
+        let Some(configured_user) = self.args.routercloud_password_recovery_user.as_deref() else {
+            return Ok(());
+        };
+
+        if !configured_email.trim().eq_ignore_ascii_case(email) {
+            return Ok(());
+        }
+
+        if !self.args.auth.has_user(configured_user) {
+            /*
+             * Błąd konfiguracji również nie może
+             * ujawniać informacji klientowi.
+             */
+            return Ok(());
+        }
+
+        let now_ms = routercloud_unix_time_ms();
+
+        /*
+         * Per-account cooldown. Klient nadal zawsze
+         * otrzymuje tę samą odpowiedź HTTP.
+         */
+        if let Ok(Some(current)) = self.load_routercloud_password_reset(configured_user).await {
+            if current.expires_at_ms > now_ms
+                && now_ms.saturating_sub(current.issued_at_ms)
+                    < ROUTERCLOUD_PASSWORD_RESET_COOLDOWN_MS
+            {
+                return Ok(());
+            }
+        }
+
+        /*
+         * Raw token istnieje wyłącznie w pamięci.
+         *
+         * W etapie SMTP zostanie przekazany bezpośrednio
+         * do generatora wiadomości. Nie zapisujemy go
+         * ani do pliku, ani do logów.
+         */
+        let (_raw_token, token_sha256) = routercloud_generate_password_reset_token();
+
+        let store = RouterCloudPasswordResetStore {
+            version: ROUTERCLOUD_PASSWORD_RESET_VERSION,
+
+            user: configured_user.to_string(),
+
+            token_sha256,
+
+            issued_at_ms: now_ms,
+
+            expires_at_ms: now_ms.saturating_add(ROUTERCLOUD_PASSWORD_RESET_TTL_MS),
+        };
+
+        self.save_routercloud_password_reset(configured_user, &store)
+            .await?;
+
+        Ok(())
+    }
+
+    fn routercloud_password_reset_store_path(&self, user: &str) -> Result<PathBuf> {
+        let parent = self
+            .args
+            .serve_path
+            .parent()
+            .ok_or_else(|| anyhow!("RouterCloud serve path has no parent"))?;
+
+        let mut hasher = Sha256::new();
+
+        hasher.update(user.as_bytes());
+
+        let user_id = hex::encode(hasher.finalize());
+
+        Ok(parent
+            .join(".routercloud-system")
+            .join("password-reset")
+            .join(format!("{user_id}.json")))
+    }
+
+    async fn load_routercloud_password_reset(
+        &self,
+        user: &str,
+    ) -> Result<Option<RouterCloudPasswordResetStore>> {
+        let path = self.routercloud_password_reset_store_path(user)?;
+
+        if !fs::try_exists(&path).await.unwrap_or_default() {
+            return Ok(None);
+        }
+
+        let data = fs::read(&path).await?;
+
+        let store: RouterCloudPasswordResetStore = serde_json::from_slice(&data)?;
+
+        if store.version != ROUTERCLOUD_PASSWORD_RESET_VERSION
+            || store.user != user
+            || store.token_sha256.len() != 64
+            || store.expires_at_ms <= store.issued_at_ms
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(store))
+    }
+
+    async fn save_routercloud_password_reset(
+        &self,
+        user: &str,
+        store: &RouterCloudPasswordResetStore,
+    ) -> Result<()> {
+        let path = self.routercloud_password_reset_store_path(user)?;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("RouterCloud password-reset path has no parent"))?;
+
+        fs::create_dir_all(parent).await?;
+
+        #[cfg(unix)]
+        fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+
+        let temp = parent.join(format!(".password-reset-{}.tmp", Uuid::new_v4()));
+
+        let data = serde_json::to_vec_pretty(store)?;
+
+        fs::write(&temp, data).await?;
+
+        #[cfg(unix)]
+        fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)).await?;
+
+        if let Err(err) = fs::rename(&temp, &path).await {
+            let _ = fs::remove_file(&temp).await;
+
+            return Err(err.into());
+        }
+
+        Ok(())
+    }
+
     fn routercloud_favorites_store_path(&self, user: &str) -> Result<PathBuf> {
         let parent = self
             .args
@@ -3116,6 +3378,33 @@ HttpOnly; Secure; SameSite=Strict"
     )
 }
 
+// ROUTERCLOUD_PASSWORD_RECOVERY_V1
+fn routercloud_unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/*
+ * Three independently generated UUIDv4 values provide
+ * substantially more than 256 bits of input entropy.
+ * SHA-256 compresses the seed into the 256-bit token.
+ */
+fn routercloud_generate_password_reset_token() -> (String, String) {
+    let mut seed = Vec::with_capacity(16 * 3);
+
+    for _ in 0..3 {
+        seed.extend_from_slice(Uuid::new_v4().as_bytes());
+    }
+
+    let raw_token = hex::encode(Sha256::digest(&seed));
+
+    let token_sha256 = hex::encode(Sha256::digest(raw_token.as_bytes()));
+
+    (raw_token, token_sha256)
+}
+
 fn routercloud_auth_no_store(res: &mut Response) {
     res.headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-store"));
@@ -3353,6 +3642,54 @@ where
 #[cfg(test)]
 mod routercloud_session_http_tests {
     use super::*;
+
+    #[test]
+    fn test_routercloud_password_reset_token_hashing() {
+        let (token_a, hash_a) = routercloud_generate_password_reset_token();
+
+        let (token_b, hash_b) = routercloud_generate_password_reset_token();
+
+        assert_eq!(token_a.len(), 64);
+        assert_eq!(hash_a.len(), 64);
+
+        assert_eq!(token_b.len(), 64);
+        assert_eq!(hash_b.len(), 64);
+
+        assert_ne!(token_a, token_b);
+        assert_ne!(hash_a, hash_b);
+
+        let expected = hex::encode(Sha256::digest(token_a.as_bytes()));
+
+        assert_eq!(hash_a, expected);
+
+        /*
+         * Persistent state receives only the hash,
+         * never the raw reset token.
+         */
+        let store = RouterCloudPasswordResetStore {
+            version: ROUTERCLOUD_PASSWORD_RESET_VERSION,
+
+            user: "alice".to_string(),
+
+            token_sha256: hash_a.clone(),
+
+            issued_at_ms: 1_000,
+
+            expires_at_ms: 1_000 + ROUTERCLOUD_PASSWORD_RESET_TTL_MS,
+        };
+
+        let json = serde_json::to_string(&store).unwrap();
+
+        assert!(json.contains(&hash_a));
+        assert!(!json.contains(&token_a));
+    }
+
+    #[test]
+    fn test_routercloud_password_reset_policy() {
+        assert_eq!(ROUTERCLOUD_PASSWORD_RESET_TTL_MS, 15 * 60 * 1000);
+
+        assert_eq!(ROUTERCLOUD_PASSWORD_RESET_COOLDOWN_MS, 60 * 1000);
+    }
 
     #[test]
     fn test_routercloud_zip_selection_path_validation() {

@@ -316,6 +316,17 @@ pub struct Args {
     pub routercloud_allow_delete: bool,
     pub routercloud_allow_edit: bool,
 
+    // ROUTERCLOUD_EMAIL_LOGIN_V1
+    //
+    // Configuration-only:
+    // routercloud-login-user
+    // routercloud-login-email
+    //
+    // The email is an alias for the configured RouterCloud account.
+    // It does not create a second DUFS user or a separate permission set.
+    pub routercloud_login_user: Option<String>,
+    pub routercloud_login_email: Option<String>,
+
     // ROUTERCLOUD_PASSWORD_RECOVERY_V1
     //
     // Configuration-only:

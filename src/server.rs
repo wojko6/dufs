@@ -774,7 +774,7 @@ impl Server {
                 .iter()
                 .any(|v| v.as_str() == req_path)
             {
-                self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
+                self.handle_send_file(&self.args.serve_path, headers, head_only, false, &mut res)
                     .await?;
             } else {
                 self.handle_not_found(&query_params, headers, head_only, &mut res)
@@ -916,7 +916,7 @@ impl Server {
                             status_forbid(&mut res);
                         }
                     } else {
-                        self.handle_send_file(path, headers, head_only, &mut res)
+                        self.handle_send_file(path, headers, head_only, false, &mut res)
                             .await?;
                     }
                 } else if render_spa {
@@ -1603,7 +1603,7 @@ impl Server {
             .map(|v| v.is_file())
             .unwrap_or_default()
         {
-            self.handle_send_file(&index_path, headers, head_only, res)
+            self.handle_send_file(&index_path, headers, head_only, false, res)
                 .await?;
         } else if self.args.render_try_index {
             self.handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
@@ -1650,7 +1650,7 @@ impl Server {
     ) -> Result<()> {
         if path.extension().is_none() {
             let path = self.args.serve_path.join(INDEX_NAME);
-            self.handle_send_file(&path, headers, head_only, res)
+            self.handle_send_file(&path, headers, head_only, false, res)
                 .await?;
         } else {
             self.handle_not_found(query_params, headers, head_only, res)
@@ -1668,7 +1668,7 @@ impl Server {
     ) -> Result<()> {
         if let Some(error_page) = &self.args.error_page {
             if !has_query_flag(query_params, "noscript") {
-                self.handle_send_file(error_page, headers, head_only, res)
+                self.handle_send_file(error_page, headers, head_only, true, res)
                     .await?;
                 *res.status_mut() = StatusCode::NOT_FOUND;
                 return Ok(());
@@ -1689,7 +1689,8 @@ impl Server {
                 Some(assets_path) => {
                     let path = assets_path.join(name);
                     if path.exists() {
-                        self.handle_send_file(&path, headers, false, res).await?;
+                        self.handle_send_file(&path, headers, false, true, res)
+                            .await?;
                     } else {
                         status_not_found(res);
                         return Ok(true);
@@ -1745,6 +1746,7 @@ impl Server {
         path: &Path,
         headers: &HeaderMap<HeaderValue>,
         head_only: bool,
+        trusted_application_asset: bool,
         res: &mut Response,
     ) -> Result<()> {
         let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
@@ -1804,13 +1806,25 @@ impl Server {
             None
         };
 
+        let content_type = get_content_type(path).await?;
+        res.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_str(&content_type)?);
         res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_str(&get_content_type(path).await?)?,
+            "x-content-type-options",
+            HeaderValue::from_static("nosniff"),
         );
 
         let filename = try_get_file_name(path)?;
-        set_content_disposition(res, true, filename)?;
+        // Explicit website-hosting modes intentionally render trusted
+        // site content inline. Never enable these modes for untrusted
+        // user-upload roots.
+        let explicit_site_hosting =
+            self.args.render_index || self.args.render_try_index || self.args.render_spa;
+
+        let active_user_file = !trusted_application_asset
+            && !explicit_site_hosting
+            && active_user_file_requires_download(&content_type);
+        set_content_disposition(res, !active_user_file, filename)?;
 
         res.headers_mut().typed_insert(AcceptRanges::bytes());
 
@@ -2263,7 +2277,8 @@ impl Server {
             return Ok(());
         }
 
-        self.handle_send_file(&path, headers, false, res).await?;
+        self.handle_send_file(&path, headers, false, true, res)
+            .await?;
 
         routercloud_auth_no_store(res);
 
@@ -4163,6 +4178,28 @@ fn set_webdav_headers(res: &mut Response) {
     );
     res.headers_mut()
         .insert("DAV", HeaderValue::from_static("1, 2, 3"));
+}
+
+fn active_user_file_requires_download(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    matches!(
+        media_type.as_str(),
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "text/xml"
+            | "application/xml"
+            | "text/javascript"
+            | "application/javascript"
+            | "text/ecmascript"
+            | "application/ecmascript"
+    ) || media_type.ends_with("+xml")
 }
 
 async fn get_content_type(path: &Path) -> Result<String> {

@@ -2,9 +2,13 @@ mod fixtures;
 mod utils;
 
 use assert_fs::fixture::TempDir;
-use fixtures::{port, server, tmpdir, wait_for_port, Error, TestServer, DIR_ASSETS};
+#[cfg(unix)]
+use fixtures::{port, wait_for_port};
+use fixtures::{server, tmpdir, Error, TestServer, DIR_ASSETS};
 use rstest::rstest;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 
 #[rstest]
 fn assets(server: TestServer) -> Result<(), Error> {
@@ -98,14 +102,24 @@ fn asset_js_with_prefix(
     Ok(())
 }
 
+#[cfg(unix)]
 #[rstest]
 fn assets_override(tmpdir: TempDir, port: u16) -> Result<(), Error> {
+    // Trusted UI assets must not reside under the served data root.
+    // Put an independent copy of the fixture's custom index in a sibling
+    // TempDir: this tests actual --assets compatibility without restoring
+    // the attacker-writable same-origin boundary.
+    let separate_assets = TempDir::new()?;
+    std::fs::copy(
+        tmpdir.join(format!("{DIR_ASSETS}index.html")),
+        separate_assets.join("index.html"),
+    )?;
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
         .arg(tmpdir.path())
         .arg("-p")
         .arg(port.to_string())
         .arg("--assets")
-        .arg(tmpdir.join(DIR_ASSETS))
+        .arg(separate_assets.path())
         .stdout(Stdio::piped())
         .spawn()?;
 
@@ -124,6 +138,64 @@ fn assets_override(tmpdir: TempDir, port: u16) -> Result<(), Error> {
     Ok(())
 }
 
+// On platforms without an fd-relative trusted-asset implementation, reject
+// external --assets at startup. Do not silently trust data-root HTML.
+#[cfg(windows)]
+#[rstest]
+fn custom_assets_fail_closed_without_fd_isolation(tmpdir: TempDir) -> Result<(), Error> {
+    let external_assets = TempDir::new()?;
+    std::fs::copy(
+        tmpdir.join(format!("{DIR_ASSETS}index.html")),
+        external_assets.join("index.html"),
+    )?;
+    let output = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("--assets")
+        .arg(external_assets.path())
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "custom assets must be refused without an fd-relative implementation"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains("not supported") || stderr.contains("unsupported"),
+        "unexpected startup error: {stderr}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn assets_nested_in_data_root_use_builtin_ui(tmpdir: TempDir, port: u16) -> Result<(), Error> {
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--assets")
+        .arg(tmpdir.join(DIR_ASSETS))
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    wait_for_port(port);
+    let url = format!("http://localhost:{port}");
+    let html = reqwest::blocking::get(&url)?.text()?;
+    let ver = env!("CARGO_PKG_VERSION");
+    assert!(!html.contains("__ASSETS_REV__"));
+    assert!(!html.starts_with(&format!("/__dufs_v{ver}__/index.js;")));
+    assert!(html.contains(&format!(r#"src="/__dufs_v{ver}__/index.js?v="#)));
+    let js = reqwest::blocking::get(format!("{url}/__dufs_v{ver}__/index.js"))?;
+    assert_eq!(js.status(), 200);
+    assert_eq!(
+        js.headers().get("content-type").unwrap(),
+        "application/javascript; charset=UTF-8"
+    );
+
+    child.kill()?;
+    Ok(())
+}
+
+#[cfg(unix)]
 #[rstest]
 fn assets_override_not_found_page(tmpdir: TempDir, port: u16) -> Result<(), Error> {
     let not_found_html = "<html><body>custom 404 page</body></html>";

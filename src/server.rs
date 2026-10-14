@@ -246,23 +246,30 @@ fn valid_routercloud_zip_selection_path(value: &str) -> bool {
     count > 0
 }
 
-fn compute_assets_revision(assets_path: Option<&Path>) -> String {
+fn compute_assets_revision_from_fd(assets_root: Option<&std::fs::File>) -> String {
     let mut hasher = Sha256::new();
-
-    if let Some(assets_path) = assets_path {
-        for name in ["index.html", "index.css", "index.js", "favicon.ico"] {
-            hasher.update(name.as_bytes());
-            if let Ok(data) = std::fs::read(assets_path.join(name)) {
-                hasher.update(&data);
+    if let Some(assets_root) = assets_root {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Read;
+            for name in ["index.html", "index.css", "index.js", "favicon.ico"] {
+                hasher.update(name.as_bytes());
+                if let Ok(mut file) = open_trusted_asset_fd(assets_root, Path::new(name)) {
+                    let mut data = Vec::new();
+                    if file.read_to_end(&mut data).is_ok() {
+                        hasher.update(&data);
+                    }
+                }
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = assets_root;
     } else {
         hasher.update(INDEX_HTML.as_bytes());
         hasher.update(INDEX_CSS.as_bytes());
         hasher.update(INDEX_JS.as_bytes());
         hasher.update(FAVICON_ICO);
     }
-
     let digest = hasher.finalize();
     digest
         .iter()
@@ -360,11 +367,111 @@ async fn rename_noreplace(path: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
+// ISSUE235_TRUSTED_ASSETS_FD_V3
+// Linux: pin the trusted directory at startup and resolve each component
+// relative to the preceding open descriptor, not by re-opening path names.
+#[cfg(target_os = "linux")]
+fn openat_trusted_component(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    if directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    // SAFETY: parent owns an open directory descriptor. The returned fd is
+    // owned by exactly one File, or -1 is handled as an error.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn open_trusted_assets_root(path: &Path) -> std::io::Result<std::fs::File> {
+    // Args::sanitize_assets_path returns a canonical absolute path. Open each
+    // directory from '/' to avoid symlink races in any ancestor of --assets.
+    let mut directory = std::fs::File::open("/")?;
+    if !path.is_absolute() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                directory = openat_trusted_component(&directory, name, true)?;
+            }
+            _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn open_trusted_asset_fd(
+    assets_root: &std::fs::File,
+    name: &Path,
+) -> std::io::Result<std::fs::File> {
+    let mut components = Vec::new();
+    for component in name.components() {
+        match component {
+            Component::Normal(part) => components.push(part),
+            _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        }
+    }
+    if components.is_empty() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    let mut directory = assets_root.try_clone()?;
+    for (i, name) in components.iter().enumerate() {
+        let last = i + 1 == components.len();
+        let opened = openat_trusted_component(&directory, name, !last)?;
+        if last {
+            return Ok(opened);
+        }
+        directory = opened;
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
+#[cfg(target_os = "linux")]
+fn read_startup_trusted_index(assets_root: &std::fs::File) -> Result<String> {
+    use std::io::Read;
+    let mut file = open_trusted_asset_fd(assets_root, Path::new("index.html"))?;
+    let mut html = String::new();
+    file.read_to_string(&mut html)?;
+    Ok(html)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_trusted_assets_root(_path: &Path) -> std::io::Result<std::fs::File> {
+    // Fail closed: path-based fallback would reintroduce the origin bypass.
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_startup_trusted_index(_assets_root: &std::fs::File) -> Result<String> {
+    anyhow::bail!("Custom trusted assets require Linux descriptor-based isolation")
+}
+
 pub struct Server {
     args: Args,
     assets_prefix: String,
     assets_revision: String,
     html: Cow<'static, str>,
+    trusted_assets_root: Option<Arc<std::fs::File>>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
 
@@ -456,7 +563,15 @@ impl Server {
         }
 
         let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
-        let assets_revision = compute_assets_revision(args.assets.as_deref());
+        let trusted_assets_root = match args.assets.as_ref() {
+            Some(path)
+                if !path.starts_with(&args.serve_path) && !args.serve_path.starts_with(path) =>
+            {
+                Some(Arc::new(open_trusted_assets_root(path)?))
+            }
+            _ => None,
+        };
+        let assets_revision = compute_assets_revision_from_fd(trusted_assets_root.as_deref());
         let single_file_req_paths = if args.path_is_file {
             vec![
                 args.uri_prefix.to_string(),
@@ -470,8 +585,8 @@ impl Server {
         } else {
             vec![]
         };
-        let html = match args.assets.as_ref() {
-            Some(path) => Cow::Owned(std::fs::read_to_string(path.join("index.html"))?),
+        let html = match trusted_assets_root.as_deref() {
+            Some(directory) => Cow::Owned(read_startup_trusted_index(directory)?),
             None => Cow::Borrowed(INDEX_HTML),
         };
         Ok(Self {
@@ -481,6 +596,7 @@ impl Server {
             assets_prefix,
             assets_revision,
             html,
+            trusted_assets_root,
             routercloud_password_reset_lock: Mutex::new(()),
         })
     }
@@ -1668,8 +1784,23 @@ impl Server {
     ) -> Result<()> {
         if let Some(error_page) = &self.args.error_page {
             if !has_query_flag(query_params, "noscript") {
-                self.handle_send_file(error_page, headers, head_only, true, res)
-                    .await?;
+                let trusted_error_page = self.args.assets.as_ref().is_some_and(|assets| {
+                    error_page == &assets.join("404.html") && self.trusted_assets_root.is_some()
+                });
+                if trusted_error_page {
+                    // The pinned root is authoritative. Never fall back to a
+                    // path-based trusted read if 404.html is replaced/linked.
+                    if let Some((path, file)) = self.open_trusted_asset("404.html").await {
+                        self.handle_send_open_file(&path, file, headers, head_only, true, res)
+                            .await?;
+                    } else {
+                        status_not_found(res);
+                        return Ok(());
+                    }
+                } else {
+                    self.handle_send_file(error_page, headers, head_only, false, res)
+                        .await?;
+                }
                 *res.status_mut() = StatusCode::NOT_FOUND;
                 return Ok(());
             }
@@ -1685,11 +1816,13 @@ impl Server {
         res: &mut Response,
     ) -> Result<bool> {
         if let Some(name) = req_path.strip_prefix(&self.assets_prefix) {
-            match self.args.assets.as_ref() {
-                Some(assets_path) => {
-                    let path = assets_path.join(name);
-                    if path.exists() {
-                        self.handle_send_file(&path, headers, false, true, res)
+            // A custom directory inside the served data root is not trusted.
+            // Fall back to the built-in assets consistently with the built-in
+            // index rather than rendering the index without its CSS/JS.
+            match self.trusted_assets_root.as_ref() {
+                Some(_) => {
+                    if let Some((path, file)) = self.open_trusted_asset(name).await {
+                        self.handle_send_open_file(&path, file, headers, false, true, res)
                             .await?;
                     } else {
                         status_not_found(res);
@@ -1741,16 +1874,55 @@ impl Server {
         }
     }
 
+    async fn open_trusted_asset(&self, name: &str) -> Option<(PathBuf, File)> {
+        let assets = self.args.assets.as_ref()?;
+        let root = self.trusted_assets_root.as_ref()?;
+        if assets.starts_with(&self.args.serve_path) || self.args.serve_path.starts_with(assets) {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let root = Arc::clone(root);
+            let requested = PathBuf::from(name);
+            let opened =
+                tokio::task::spawn_blocking(move || open_trusted_asset_fd(&root, &requested))
+                    .await
+                    .ok()?
+                    .ok()?;
+            // This path is used exclusively for MIME/filename/response metadata,
+            // never for another disk open on the trusted code path.
+            Some((assets.join(name), File::from_std(opened)))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (assets, root, name);
+            None
+        }
+    }
+
     async fn handle_send_file(
         &self,
         path: &Path,
         headers: &HeaderMap<HeaderValue>,
         head_only: bool,
-        trusted_application_asset: bool,
+        trusted_asset: bool,
         res: &mut Response,
     ) -> Result<()> {
-        let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
-        let (mut file, meta) = (file?, meta?);
+        let file = fs::File::open(path).await?;
+        self.handle_send_open_file(path, file, headers, head_only, trusted_asset, res)
+            .await
+    }
+
+    async fn handle_send_open_file(
+        &self,
+        path: &Path,
+        mut file: File,
+        headers: &HeaderMap<HeaderValue>,
+        head_only: bool,
+        trusted_asset: bool,
+        res: &mut Response,
+    ) -> Result<()> {
+        let meta = file.metadata().await?;
         let size = meta.len();
         let mut use_range = true;
         if let Some((etag, last_modified)) = extract_cache_headers(&meta) {
@@ -1806,25 +1978,32 @@ impl Server {
             None
         };
 
-        let content_type = get_content_type(path).await?;
+        let content_type = get_content_type_from_open_file(&mut file, path).await?;
+        // Preserve explicitly requested Dufs website-hosting modes from PR #3.
+        // These modes must NOT be enabled for the authenticated RouterCloud data root.
+        let explicit_site_hosting =
+            self.args.render_index || self.args.render_try_index || self.args.render_spa;
+        let force_download = !trusted_asset
+            && !explicit_site_hosting
+            && is_untrusted_active_document(path, &content_type);
+
         res.headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_str(&content_type)?);
+
         res.headers_mut().insert(
             "x-content-type-options",
             HeaderValue::from_static("nosniff"),
         );
 
-        let filename = try_get_file_name(path)?;
-        // Explicit website-hosting modes intentionally render trusted
-        // site content inline. Never enable these modes for untrusted
-        // user-upload roots.
-        let explicit_site_hosting =
-            self.args.render_index || self.args.render_try_index || self.args.render_spa;
+        if force_download {
+            res.headers_mut().insert(
+                "content-security-policy",
+                HeaderValue::from_static("sandbox"),
+            );
+        }
 
-        let active_user_file = !trusted_application_asset
-            && !explicit_site_hosting
-            && active_user_file_requires_download(&content_type);
-        set_content_disposition(res, !active_user_file, filename)?;
+        let filename = try_get_file_name(path)?;
+        set_content_disposition(res, !force_download, filename)?;
 
         res.headers_mut().typed_insert(AcceptRanges::bytes());
 
@@ -1855,7 +2034,6 @@ impl Server {
                     *res.status_mut() = StatusCode::PARTIAL_CONTENT;
                     let boundary = Uuid::new_v4();
                     let mut body = Vec::new();
-                    let content_type = get_content_type(path).await?;
                     for (start, end) in ranges {
                         file.seek(SeekFrom::Start(start)).await?;
                         let range_size = end - start + 1;
@@ -2265,19 +2443,12 @@ impl Server {
         headers: &HeaderMap<HeaderValue>,
         res: &mut Response,
     ) -> Result<()> {
-        let Some(assets_path) = self.args.assets.as_ref() else {
+        let Some((path, file)) = self.open_trusted_asset(name).await else {
             status_not_found(res);
             return Ok(());
         };
 
-        let path = assets_path.join(name);
-
-        if !fs::try_exists(&path).await.unwrap_or_default() {
-            status_not_found(res);
-            return Ok(());
-        }
-
-        self.handle_send_file(&path, headers, false, true, res)
+        self.handle_send_open_file(&path, file, headers, false, true, res)
             .await?;
 
         routercloud_auth_no_store(res);
@@ -4133,6 +4304,53 @@ fn status_bad_request(res: &mut Response, body: &str) {
     }
 }
 
+fn is_untrusted_active_document(path: &Path, content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let active_mime = matches!(
+        media_type.as_str(),
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "text/xml"
+            | "application/xml"
+            | "application/xslt+xml"
+            | "text/javascript"
+            | "application/javascript"
+            | "text/ecmascript"
+            | "application/ecmascript"
+    ) || media_type.ends_with("+xml");
+
+    let active_extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "html"
+                    | "htm"
+                    | "shtml"
+                    | "xhtml"
+                    | "xht"
+                    | "svg"
+                    | "svgz"
+                    | "xml"
+                    | "xsl"
+                    | "xslt"
+                    | "mhtml"
+                    | "mht"
+            )
+        })
+        .unwrap_or(false);
+
+    active_mime || active_extension
+}
+
 fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {
     let kind = if inline { "inline" } else { "attachment" };
     let filename: String = filename
@@ -4180,35 +4398,14 @@ fn set_webdav_headers(res: &mut Response) {
         .insert("DAV", HeaderValue::from_static("1, 2, 3"));
 }
 
-fn active_user_file_requires_download(content_type: &str) -> bool {
-    let media_type = content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-
-    matches!(
-        media_type.as_str(),
-        "text/html"
-            | "application/xhtml+xml"
-            | "image/svg+xml"
-            | "text/xml"
-            | "application/xml"
-            | "text/javascript"
-            | "application/javascript"
-            | "text/ecmascript"
-            | "application/ecmascript"
-    ) || media_type.ends_with("+xml")
-}
-
-async fn get_content_type(path: &Path) -> Result<String> {
+async fn get_content_type_from_open_file(file: &mut File, path: &Path) -> Result<String> {
     let mut buffer: Vec<u8> = vec![];
-    fs::File::open(path)
-        .await?
-        .take(1024)
-        .read_to_end(&mut buffer)
-        .await?;
+
+    file.seek(SeekFrom::Start(0)).await?;
+
+    (&mut *file).take(1024).read_to_end(&mut buffer).await?;
+
+    file.seek(SeekFrom::Start(0)).await?;
     let mime = mime_guess::from_path(path).first();
     let is_text = content_inspector::inspect(&buffer).is_text();
     let content_type = if is_text {
@@ -4625,5 +4822,53 @@ mod routercloud_session_http_tests {
         assert!(cookie.contains("SameSite=Strict"));
 
         assert!(!cookie.contains("Domain="));
+    }
+}
+
+// ISSUE235_TRUSTED_ASSETS_FD_V3_REGRESSION
+#[cfg(all(test, target_os = "linux"))]
+mod issue235_trusted_fd_tests {
+    use super::{open_trusted_asset_fd, open_trusted_assets_root};
+    use assert_fs::fixture::TempDir;
+    use std::fs;
+    use std::io::Read;
+    use std::path::Path;
+
+    #[test]
+    fn pinned_root_ignores_replacement_of_original_path() {
+        let tmp = TempDir::new().unwrap();
+        let assets = tmp.path().join("assets");
+        let moved = tmp.path().join("old-assets");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&assets).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(assets.join("safe.js"), b"trusted").unwrap();
+        fs::write(outside.join("safe.js"), b"untrusted").unwrap();
+        let pinned = open_trusted_assets_root(&assets).unwrap();
+        fs::rename(&assets, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &assets).unwrap();
+        let mut opened = open_trusted_asset_fd(&pinned, Path::new("safe.js")).unwrap();
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"trusted");
+    }
+
+    #[test]
+    fn rejects_symlink_at_intermediate_and_final_components() {
+        let tmp = TempDir::new().unwrap();
+        let assets = tmp.path().join("assets");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&assets).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(assets.join("nested")).unwrap();
+        fs::write(outside.join("payload.js"), b"untrusted").unwrap();
+        std::os::unix::fs::symlink(&outside, assets.join("linked-dir")).unwrap();
+        std::os::unix::fs::symlink(outside.join("payload.js"), assets.join("link.js")).unwrap();
+        let pinned = open_trusted_assets_root(&assets).unwrap();
+        assert!(open_trusted_asset_fd(&pinned, Path::new("linked-dir/payload.js")).is_err());
+        assert!(open_trusted_asset_fd(&pinned, Path::new("link.js")).is_err());
+        assert!(open_trusted_asset_fd(&pinned, Path::new("../outside/payload.js")).is_err());
+        assert!(open_trusted_asset_fd(&pinned, Path::new("/etc/passwd")).is_err());
+        assert!(open_trusted_asset_fd(&pinned, Path::new(".")).is_err());
     }
 }

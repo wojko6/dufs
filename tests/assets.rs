@@ -100,12 +100,21 @@ fn asset_js_with_prefix(
 
 #[rstest]
 fn assets_override(tmpdir: TempDir, port: u16) -> Result<(), Error> {
+    // Trusted UI assets must not reside under the served data root.
+    // Put an independent copy of the fixture's custom index in a sibling
+    // TempDir: this tests actual --assets compatibility without restoring
+    // the attacker-writable same-origin boundary.
+    let separate_assets = TempDir::new()?;
+    std::fs::copy(
+        tmpdir.join(format!("{DIR_ASSETS}index.html")),
+        separate_assets.join("index.html"),
+    )?;
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
         .arg(tmpdir.path())
         .arg("-p")
         .arg(port.to_string())
         .arg("--assets")
-        .arg(tmpdir.join(DIR_ASSETS))
+        .arg(separate_assets.path())
         .stdout(Stdio::piped())
         .spawn()?;
 
@@ -119,6 +128,36 @@ fn assets_override(tmpdir: TempDir, port: u16) -> Result<(), Error> {
     )));
     let resp = reqwest::blocking::get(&url)?;
     assert_resp_paths!(resp);
+
+    child.kill()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[rstest]
+fn assets_nested_in_data_root_use_builtin_ui(tmpdir: TempDir, port: u16) -> Result<(), Error> {
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--assets")
+        .arg(tmpdir.join(DIR_ASSETS))
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    wait_for_port(port);
+    let url = format!("http://localhost:{port}");
+    let html = reqwest::blocking::get(&url)?.text()?;
+    let ver = env!("CARGO_PKG_VERSION");
+    assert!(!html.contains("__ASSETS_REV__"));
+    assert!(!html.starts_with(&format!("/__dufs_v{ver}__/index.js;")));
+    assert!(html.contains(&format!(r#"src="/__dufs_v{ver}__/index.js?v="#)));
+    let js = reqwest::blocking::get(format!("{url}/__dufs_v{ver}__/index.js"))?;
+    assert_eq!(js.status(), 200);
+    assert_eq!(
+        js.headers().get("content-type").unwrap(),
+        "application/javascript; charset=UTF-8"
+    );
 
     child.kill()?;
     Ok(())

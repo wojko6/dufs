@@ -4844,7 +4844,8 @@ mod issue235_trusted_fd_tests {
         fs::create_dir(&outside).unwrap();
         fs::write(assets.join("safe.js"), b"trusted").unwrap();
         fs::write(outside.join("safe.js"), b"untrusted").unwrap();
-        let pinned = open_trusted_assets_root(&assets).unwrap();
+        let canonical_assets = fs::canonicalize(&assets).unwrap();
+        let pinned = open_trusted_assets_root(&canonical_assets).unwrap();
         fs::rename(&assets, &moved).unwrap();
         std::os::unix::fs::symlink(&outside, &assets).unwrap();
         let mut opened = open_trusted_asset_fd(&pinned, Path::new("safe.js")).unwrap();
@@ -4864,7 +4865,8 @@ mod issue235_trusted_fd_tests {
         fs::write(outside.join("payload.js"), b"untrusted").unwrap();
         std::os::unix::fs::symlink(&outside, assets.join("linked-dir")).unwrap();
         std::os::unix::fs::symlink(outside.join("payload.js"), assets.join("link.js")).unwrap();
-        let pinned = open_trusted_assets_root(&assets).unwrap();
+        let canonical_assets = fs::canonicalize(&assets).unwrap();
+        let pinned = open_trusted_assets_root(&canonical_assets).unwrap();
         assert!(open_trusted_asset_fd(&pinned, Path::new("linked-dir/payload.js")).is_err());
         assert!(open_trusted_asset_fd(&pinned, Path::new("link.js")).is_err());
         assert!(open_trusted_asset_fd(&pinned, Path::new("../outside/payload.js")).is_err());

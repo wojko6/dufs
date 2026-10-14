@@ -249,7 +249,7 @@ fn valid_routercloud_zip_selection_path(value: &str) -> bool {
 fn compute_assets_revision_from_fd(assets_root: Option<&std::fs::File>) -> String {
     let mut hasher = Sha256::new();
     if let Some(assets_root) = assets_root {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             use std::io::Read;
             for name in ["index.html", "index.css", "index.js", "favicon.ico"] {
@@ -262,7 +262,7 @@ fn compute_assets_revision_from_fd(assets_root: Option<&std::fs::File>) -> Strin
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         let _ = assets_root;
     } else {
         hasher.update(INDEX_HTML.as_bytes());
@@ -368,9 +368,9 @@ async fn rename_noreplace(path: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 // ISSUE235_TRUSTED_ASSETS_FD_V3
-// Linux: pin the trusted directory at startup and resolve each component
+// Unix: pin the trusted directory at startup and resolve each component
 // relative to the preceding open descriptor, not by re-opening path names.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn openat_trusted_component(
     parent: &std::fs::File,
     name: &std::ffi::OsStr,
@@ -399,7 +399,7 @@ fn openat_trusted_component(
     Ok(file)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn open_trusted_assets_root(path: &Path) -> std::io::Result<std::fs::File> {
     // Args::sanitize_assets_path returns a canonical absolute path. Open each
     // directory from '/' to avoid symlink races in any ancestor of --assets.
@@ -419,7 +419,7 @@ fn open_trusted_assets_root(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(directory)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn open_trusted_asset_fd(
     assets_root: &std::fs::File,
     name: &Path,
@@ -446,7 +446,7 @@ fn open_trusted_asset_fd(
     Err(std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn read_startup_trusted_index(assets_root: &std::fs::File) -> Result<String> {
     use std::io::Read;
     let mut file = open_trusted_asset_fd(assets_root, Path::new("index.html"))?;
@@ -455,15 +455,15 @@ fn read_startup_trusted_index(assets_root: &std::fs::File) -> Result<String> {
     Ok(html)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn open_trusted_assets_root(_path: &Path) -> std::io::Result<std::fs::File> {
     // Fail closed: path-based fallback would reintroduce the origin bypass.
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn read_startup_trusted_index(_assets_root: &std::fs::File) -> Result<String> {
-    anyhow::bail!("Custom trusted assets require Linux descriptor-based isolation")
+    anyhow::bail!("Custom trusted assets require Unix descriptor-based isolation")
 }
 
 pub struct Server {
@@ -1880,7 +1880,7 @@ impl Server {
         if assets.starts_with(&self.args.serve_path) || self.args.serve_path.starts_with(assets) {
             return None;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             let root = Arc::clone(root);
             let requested = PathBuf::from(name);
@@ -1893,7 +1893,7 @@ impl Server {
             // never for another disk open on the trusted code path.
             Some((assets.join(name), File::from_std(opened)))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             let _ = (assets, root, name);
             None
@@ -4826,7 +4826,7 @@ mod routercloud_session_http_tests {
 }
 
 // ISSUE235_TRUSTED_ASSETS_FD_V3_REGRESSION
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod issue235_trusted_fd_tests {
     use super::{open_trusted_asset_fd, open_trusted_assets_root};
     use assert_fs::fixture::TempDir;

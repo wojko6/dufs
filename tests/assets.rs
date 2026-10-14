@@ -2,9 +2,13 @@ mod fixtures;
 mod utils;
 
 use assert_fs::fixture::TempDir;
-use fixtures::{port, server, tmpdir, wait_for_port, Error, TestServer, DIR_ASSETS};
+#[cfg(unix)]
+use fixtures::{port, wait_for_port};
+use fixtures::{server, tmpdir, Error, TestServer, DIR_ASSETS};
 use rstest::rstest;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 
 #[rstest]
 fn assets(server: TestServer) -> Result<(), Error> {
@@ -98,6 +102,7 @@ fn asset_js_with_prefix(
     Ok(())
 }
 
+#[cfg(unix)]
 #[rstest]
 fn assets_override(tmpdir: TempDir, port: u16) -> Result<(), Error> {
     // Trusted UI assets must not reside under the served data root.
@@ -133,7 +138,34 @@ fn assets_override(tmpdir: TempDir, port: u16) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+// On platforms without an fd-relative trusted-asset implementation, reject
+// external --assets at startup. Do not silently trust data-root HTML.
+#[cfg(windows)]
+#[rstest]
+fn custom_assets_fail_closed_without_fd_isolation(tmpdir: TempDir) -> Result<(), Error> {
+    let external_assets = TempDir::new()?;
+    std::fs::copy(
+        tmpdir.join(format!("{DIR_ASSETS}index.html")),
+        external_assets.join("index.html"),
+    )?;
+    let output = Command::new(assert_cmd::cargo::cargo_bin!())
+        .arg(tmpdir.path())
+        .arg("--assets")
+        .arg(external_assets.path())
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "custom assets must be refused without an fd-relative implementation"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains("not supported") || stderr.contains("unsupported"),
+        "unexpected startup error: {stderr}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 #[rstest]
 fn assets_nested_in_data_root_use_builtin_ui(tmpdir: TempDir, port: u16) -> Result<(), Error> {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
@@ -163,6 +195,7 @@ fn assets_nested_in_data_root_use_builtin_ui(tmpdir: TempDir, port: u16) -> Resu
     Ok(())
 }
 
+#[cfg(unix)]
 #[rstest]
 fn assets_override_not_found_page(tmpdir: TempDir, port: u16) -> Result<(), Error> {
     let not_found_html = "<html><body>custom 404 page</body></html>";

@@ -337,6 +337,7 @@ fn issue235_custom_error_page_untrusted(tmpdir: TempDir, port: u16) -> Result<()
     Ok(())
 }
 
+#[cfg(unix)]
 #[rstest]
 #[case(false, "inline;", false)]
 #[case(true, "attachment;", true)]
@@ -499,7 +500,7 @@ fn issue235_symlinked_trusted_asset_must_be_rejected(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[rstest]
 fn issue235_startup_index_symlink_is_rejected(tmpdir: TempDir, port: u16) -> Result<(), Error> {
     use std::os::unix::fs::symlink;
@@ -554,7 +555,7 @@ fn issue235_startup_index_symlink_is_rejected(tmpdir: TempDir, port: u16) -> Res
 }
 
 // ISSUE235_TRUSTED_ASSETS_FD_V3_HTTP_REGRESSION
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[rstest]
 fn issue235_trusted_http_assets_survive_root_path_replacement(
     tmpdir: TempDir,
@@ -637,7 +638,7 @@ fn issue235_trusted_http_assets_survive_root_path_replacement(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[rstest]
 fn issue235_trusted_http_nested_directory_symlink_is_rejected(
     tmpdir: TempDir,

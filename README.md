@@ -1,3 +1,6 @@
+> **Repository-specific fork status (2026-11-04):** this `wojko6/dufs` fork retains the original [sigoden/dufs](https://github.com/sigoden/dufs) README below. Upstream badges, Cargo/Docker installation instructions and linked releases belong to **upstream**; they do not establish the build, release, or production installation status of this fork.
+>
+> Local RouterCloud-specific changes: [PR #3](https://github.com/wojko6/dufs/pull/3) was merged on 2026-10-13 to harden active-file responses. The additional directory-FD/path-swap (TOCTOU) work in [Draft PR #4](https://github.com/wojko6/dufs/pull/4) is **still open and unmerged**; do not describe its controls as active `main` behavior or a proven production deployment. Any runtime acceptance must come from separate dated RouterCloud/ASUS evidence.
 # Dufs
 
 [![CI](https://github.com/sigoden/dufs/actions/workflows/ci.yaml/badge.svg)](https://github.com/sigoden/dufs/actions/workflows/ci.yaml)
